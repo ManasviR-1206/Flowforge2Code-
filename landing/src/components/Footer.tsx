@@ -1,6 +1,8 @@
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 
 export const Footer: React.FC = () => {
+  const navigate = useNavigate();
   return (
     <footer id="about" className="relative border-t border-white/10 py-12 px-4 sm:px-6 lg:px-8 bg-slate-950/80 backdrop-blur-md z-10">
       <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center space-y-6 md:space-y-0">
@@ -30,7 +32,7 @@ export const Footer: React.FC = () => {
           <a href="#hero" className="hover:text-cyan-400 transition-colors">Home</a>
           <a href="#features" className="hover:text-cyan-400 transition-colors">Features</a>
           <a href="#how-it-works" className="hover:text-cyan-400 transition-colors">How It Works</a>
-          <a href="http://localhost:8501" target="_blank" rel="noopener noreferrer" className="hover:text-cyan-400 transition-colors">App Server</a>
+          <button onClick={() => navigate('/workspace')} className="hover:text-cyan-400 transition-colors">Workspace</button>
         </div>
 
         {/* Copyright */}

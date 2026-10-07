@@ -1,6 +1,8 @@
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 
 export const HowItWorksSection: React.FC = () => {
+  const navigate = useNavigate();
   const steps = [
     {
       num: "01",
@@ -66,14 +68,12 @@ export const HowItWorksSection: React.FC = () => {
       {/* CTA Box */}
       <div className="mt-16 text-center">
         <div className="inline-block p-[1px] rounded-full bg-gradient-to-r from-cyan-500 via-purple-500 to-cyan-500 shadow-[0_0_40px_rgba(6,182,212,0.4)]">
-          <a
-            href="http://localhost:8501"
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            onClick={() => navigate('/workspace')}
             className="block px-10 py-4 rounded-full bg-slate-950 text-white font-heading font-bold text-base hover:bg-cyan-400 hover:text-black transition-all"
           >
             Launch FlowForge AI Application →
-          </a>
+          </button>
         </div>
       </div>
 

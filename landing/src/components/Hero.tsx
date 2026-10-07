@@ -1,4 +1,5 @@
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Robot } from './Robot';
 import { FlowchartVisual } from './FlowchartVisual';
 import { CodePreview } from './CodePreview';
@@ -8,6 +9,7 @@ import { useMouseParallax } from '../hooks/useMouseParallax';
 export const Hero: React.FC = () => {
   const { displayedText } = useTypewriter("Draw it. Understand it. Generate it. Run it.", 38, 600);
   const parallax = useMouseParallax();
+  const navigate = useNavigate();
 
   return (
     <section id="hero" className="relative min-h-[calc(100vh-80px)] pt-20 pb-6 px-4 sm:px-6 lg:px-8 flex flex-col justify-start items-center overflow-hidden">
@@ -16,7 +18,7 @@ export const Hero: React.FC = () => {
       <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-cyan-500/10 rounded-full blur-[120px] pointer-events-none z-0" />
       <div className="absolute top-1/3 left-1/2 -translate-x-1/2 w-[700px] h-[350px] bg-purple-600/10 rounded-full blur-[140px] pointer-events-none z-0" />
 
-      {/* Main Hero Header Content (Compact Above-The-Fold Layout) */}
+      {/* Main Hero Header Content */}
       <div className="relative z-10 max-w-4xl mx-auto text-center flex flex-col items-center">
         
         {/* Top Eyebrow Label */}
@@ -40,15 +42,13 @@ export const Hero: React.FC = () => {
 
         {/* Highly Prominent CTA Button */}
         <div className="mt-4 flex items-center justify-center w-full">
-          <a
-            href="http://localhost:8501"
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            onClick={() => navigate('/workspace')}
             className="px-8 py-3 rounded-full bg-white text-black font-heading font-extrabold text-sm sm:text-base hover:bg-cyan-300 hover:text-black transition-all duration-300 transform hover:scale-105 shadow-[0_0_30px_rgba(0,240,255,0.7),0_0_50px_rgba(168,85,247,0.4)] text-center tracking-wide flex items-center gap-2 group"
           >
             <span>Create Flowchart</span>
             <span className="group-hover:translate-x-1 transition-transform">→</span>
-          </a>
+          </button>
         </div>
       </div>
 

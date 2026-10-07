@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  flowforge-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flowforge_ai_dashboard
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./flowforge.db
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - flowforge_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  flowforge_data:

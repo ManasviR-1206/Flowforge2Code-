@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MobileMenu } from './MobileMenu';
 
 export const Navbar: React.FC = () => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const navigate = useNavigate();
 
   return (
     <>
@@ -36,14 +38,12 @@ export const Navbar: React.FC = () => {
 
           {/* Desktop CTA */}
           <div className="hidden md:flex items-center space-x-4">
-            <a
-              href="http://localhost:8501"
-              target="_blank"
-              rel="noopener noreferrer"
+            <button
+              onClick={() => navigate('/workspace')}
               className="px-6 py-2.5 rounded-full bg-white text-black font-heading font-medium text-sm hover:bg-cyan-400 hover:text-black transition-all duration-300 transform hover:scale-105 shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:shadow-[0_0_30px_rgba(6,182,212,0.6)]"
             >
               Try FlowForge AI →
-            </a>
+            </button>
           </div>
 
           {/* Mobile Hamburger Button */}
