@@ -109,7 +109,9 @@ export const WorkspacePage: React.FC = () => {
   const [loadingCode, setLoadingCode] = useState(false);
   const [copied, setCopied] = useState(false);
   const [userInput, setUserInput] = useState('');
-  const [execOutput, setExecOutput] = useState('');
+  const [execStatus, setExecStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [execProgramOutput, setExecProgramOutput] = useState('');
+  const [execErrorDetails, setExecErrorDetails] = useState('');
   const [loadingRun, setLoadingRun] = useState(false);
   const [debugIssues, setDebugIssues] = useState<any[]>([]);
   const [debugSummary, setDebugSummary] = useState('');
@@ -236,7 +238,7 @@ export const WorkspacePage: React.FC = () => {
   const handleClear = () => {
     snapshot();
     setNodes([]); setEdges([]);
-    setGeneratedCode(''); setExecOutput(''); setDebugIssues([]); setDebugSummary(''); setErrorNodeIds([]);
+    setGeneratedCode(''); setExecStatus('idle'); setExecProgramOutput(''); setExecErrorDetails(''); setDebugIssues([]); setDebugSummary(''); setErrorNodeIds([]);
   };
   const handleDeleteSelected = () => {
     snapshot();
@@ -274,7 +276,9 @@ export const WorkspacePage: React.FC = () => {
     setNodes(enriched);
     setEdges(enrichedEdges);
     setGeneratedCode('');
-    setExecOutput('');
+    setExecStatus('idle');
+    setExecProgramOutput('');
+    setExecErrorDetails('');
     setDebugIssues([]);
     setDebugSummary('');
     setErrorNodeIds([]);
@@ -413,17 +417,26 @@ export const WorkspacePage: React.FC = () => {
     if (!generatedCode) return;
     setLoadingRun(true);
     setRunOpen(true);
-    setExecOutput('Running…');
+    setExecStatus('idle');
+    setExecProgramOutput('');
+    setExecErrorDetails('');
     setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
     try {
       const data = await apiJson('/api/execute', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: generatedCode, user_input: userInput }),
       });
-      setExecOutput(data.output || 'No output.');
+      const status = data.status === 'error' ? 'error' : data.success ? 'success' : 'idle';
+      const programOutput = typeof data.program_output === 'string' ? data.program_output : (typeof data.output === 'string' ? data.output : '');
+      const errorDetails = typeof data.error_details === 'string' ? data.error_details : '';
+      setExecStatus(status);
+      setExecProgramOutput(programOutput);
+      setExecErrorDetails(errorDetails);
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
     } catch (e: any) {
-      setExecOutput(`Execution error: ${e.message}`);
+      setExecStatus('error');
+      setExecProgramOutput('');
+      setExecErrorDetails(e.message || 'Execution error');
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
     }
     setLoadingRun(false);
@@ -850,31 +863,63 @@ export const WorkspacePage: React.FC = () => {
               <button onClick={() => setRunOpen(!runOpen)} className="text-slate-500 text-xs">{runOpen ? '▲' : '▼'}</button>
             </div>
             {runOpen && (
-              <div className="p-3 space-y-2">
+              <div className="p-3 space-y-3">
                 <div className="flex flex-col gap-1.5">
-                  <span className="text-[10px] font-semibold text-slate-400">Inputs / stdin (one value per line):</span>
-                  <div className="flex gap-2 items-start">
+                  <label className="text-[10px] font-semibold text-slate-400">Program Input (one value per line)</label>
+                  <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-start">
                     <textarea
                       value={userInput}
                       onChange={e => setUserInput(e.target.value)}
-                      placeholder="Enter values line by line:&#10;5&#10;10&#10;+"
-                      rows={2}
-                      className="flex-1 bg-slate-900 border border-slate-700 focus:border-green-500 text-xs rounded-lg p-2 outline-none font-mono resize-y min-h-[48px]"
+                      placeholder={'Enter each value on a new line\n5\n10\n12'}
+                      rows={3}
+                      className="flex-1 bg-slate-900 border border-slate-700 focus:border-green-500 text-xs rounded-lg p-2 outline-none font-mono resize-y min-h-[72px]"
                     />
                     <button
                       onClick={handleRunCode}
                       disabled={!generatedCode || loadingRun}
-                      className="px-3 py-3 bg-green-700 hover:bg-green-600 text-xs font-bold rounded-lg disabled:opacity-40 shrink-0 self-stretch flex items-center justify-center shadow-[0_0_10px_rgba(34,197,94,0.3)]"
+                      className="px-3 py-3 bg-green-700 hover:bg-green-600 text-xs font-bold rounded-lg disabled:opacity-40 shrink-0 self-stretch sm:self-auto flex items-center justify-center shadow-[0_0_10px_rgba(34,197,94,0.3)]"
                     >
                       {loadingRun ? 'Running…' : 'Run Code'}
                     </button>
                   </div>
                 </div>
-                <div className="space-y-1">
-                  <span className="text-[10px] font-semibold text-slate-400">Output:</span>
-                  <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 min-h-[60px] font-mono text-xs text-green-300 whitespace-pre-wrap max-h-48 overflow-y-auto">
-                    {execOutput || <span className="text-slate-600">Output will appear here…</span>}
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-semibold text-slate-400">Status:</span>
+                    <span className={`text-[10px] font-bold ${execStatus === 'success' ? 'text-green-400' : execStatus === 'error' ? 'text-red-400' : 'text-slate-500'}`}>
+                      {execStatus === 'success' ? 'Success' : execStatus === 'error' ? 'Error' : 'Idle'}
+                    </span>
                   </div>
+
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-semibold text-slate-400">Program Output:</span>
+                    <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 min-h-[60px] font-mono text-xs text-green-300 whitespace-pre-wrap max-h-48 overflow-y-auto">
+                      {execStatus === 'idle' ? <span className="text-slate-600">Output will appear here…</span> : execProgramOutput || <span className="text-slate-500">No program output.</span>}
+                    </div>
+                  </div>
+
+                  {execErrorDetails && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-semibold text-slate-400">Error Details:</span>
+                      <div className="bg-red-950/40 border border-red-800/60 rounded-lg p-3 font-mono text-xs text-red-200 whitespace-pre-wrap max-h-36 overflow-y-auto">
+                        {execErrorDetails}
+                      </div>
+                    </div>
+                  )}
+
+                  {(execStatus === 'success' || execStatus === 'error') && (
+                    <button
+                      onClick={() => {
+                        setExecStatus('idle');
+                        setExecProgramOutput('');
+                        setExecErrorDetails('');
+                      }}
+                      className="px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-900 text-[10px] font-semibold text-slate-300 hover:border-slate-500"
+                    >
+                      Clear Output
+                    </button>
+                  )}
                   <div ref={outputEndRef} />
                 </div>
               </div>

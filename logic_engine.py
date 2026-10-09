@@ -1124,6 +1124,20 @@ def prompt_to_flowchart(prompt: str) -> Optional[dict]:
             E(4, 6), E(5, 6),
         ]}
 
+    if "positive" in p and "negative" not in p and "zero" not in p:
+        return {"nodes": [
+            N(1, "start_end", 300, 40, "Start"),
+            N(2, "input_output", 300, 150, "Input n"),
+            N(3, "decision", 300, 270, "n > 0?"),
+            N(4, "input_output", 180, 410, 'Print "Positive"'),
+            N(5, "input_output", 420, 410, 'Print "Not positive"'),
+            N(6, "start_end", 300, 540, "End"),
+        ], "edges": [
+            E(1, 2), E(2, 3),
+            E(3, 4, "Yes", "yes"), E(3, 5, "No", "no"),
+            E(4, 6), E(5, 6),
+        ]}
+
     if "positive" in p and "negative" in p and "zero" in p:
         return {"nodes": [
             N(1, "start_end", 300, 20, "Start"),

@@ -1,5 +1,6 @@
 import ast
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,10 +40,23 @@ def run_code_safely(code_str, user_inputs_str="", timeout_sec=5):
     except ValueError as e:
         return f"Security Error: {e}"
 
+    wrapped_code = (
+        "import builtins\n"
+        "import sys\n"
+        "_flowforge_original_input = builtins.input\n"
+        "def _flowforge_input(prompt=''):\n"
+        "    if prompt is not None:\n"
+        "        sys.stdout.write(str(prompt).rstrip() + '\\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    return _flowforge_original_input()\n"
+        "builtins.input = _flowforge_input\n"
+        f"{code_str}"
+    )
+
     fd, path = tempfile.mkstemp(suffix=".py", prefix="flowforge_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(code_str)
+            handle.write(wrapped_code)
         env = {
             "PATH": os.environ.get("PATH", ""),
             "PYTHONIOENCODING": "utf-8",
@@ -72,14 +86,15 @@ def run_code_safely(code_str, user_inputs_str="", timeout_sec=5):
                 cwd=tempfile.gettempdir(),
                 env=env,
             )
-        out = proc.stdout or ""
-        err = proc.stderr or ""
+        out = (proc.stdout or "").replace("\r\n", "\n")
+        err = (proc.stderr or "").replace("\r\n", "\n")
+        out = re.sub(r"(?<!\n)(Enter\s+[^\n]*?:\s*)(?=Enter\s+|\S|$)", lambda m: m.group(1) + "\n", out)
         if proc.returncode != 0:
             if "EOFError" in err:
                 return (
                     out
                     + "\nExecution stopped: the program asked for more input values "
-                    + "than you provided. Add more lines in the Inputs / stdin box "
+                    + "than you provided. Add more lines in the Program Input box "
                     + "(one value per line), then run again."
                 ).strip()
             if err:

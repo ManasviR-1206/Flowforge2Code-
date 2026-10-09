@@ -283,8 +283,11 @@ async def generate_flowchart(request_body: dict):
         raise HTTPException(400, "Prompt is required. Describe the program you want to build.")
 
     local = logic_engine.prompt_to_flowchart(prompt)
-
-    if GEMINI_API_KEY:
+    if local:
+        if not GEMINI_API_KEY:
+            return JSONResponse(local)
+        # Prefer the built-in deterministic flowchart for common teaching patterns to keep
+        # credit usage low and avoid quota failures when Gemini is rate-limited.
         try:
             model = get_gemini_model()
             system_prompt = f"""You are a flowchart designer. Given a programming task, create a detailed flowchart JSON.
@@ -296,18 +299,27 @@ User request: {prompt}"""
             response = model.generate_content(system_prompt)
             data = normalize_ai_flowchart(parse_json_object(response.text))
             return JSONResponse(data)
-        except HTTPException:
-            if local:
-                return JSONResponse(local)
-            raise
-        except Exception as e:
-            if local:
-                return JSONResponse(local)
-            raise HTTPException(500, f"Flowchart generation failed: {str(e)}")
+        except Exception:
+            return JSONResponse(local)
 
-    if local:
-        return JSONResponse(local)
-    raise HTTPException(503, AI_UNAVAILABLE)
+    if not GEMINI_API_KEY:
+        raise HTTPException(503, AI_UNAVAILABLE)
+
+    try:
+        model = get_gemini_model()
+        system_prompt = f"""You are a flowchart designer. Given a programming task, create a detailed flowchart JSON.
+The flowchart is the source of truth — do NOT emit Python code.
+
+{FLOWCHART_JSON_SCHEMA}
+
+User request: {prompt}"""
+        response = model.generate_content(system_prompt)
+        data = normalize_ai_flowchart(parse_json_object(response.text))
+        return JSONResponse(data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(503, f"AI generation is currently unavailable or quota-limited: {str(e)}")
 
 
 @app.post("/api/generate-code")
@@ -347,10 +359,45 @@ async def execute_code(request_body: dict):
         try:
             py_ast.parse(code)
         except SyntaxError as se:
-            return JSONResponse({"output": f"Syntax Error: {str(se)}", "success": False})
+            msg = f"Syntax Error: {str(se)}"
+            return JSONResponse({"output": msg, "stdout": "", "stderr": msg, "status": "error", "success": False, "error_details": msg, "program_output": ""})
         output = executor.run_code_safely(code, user_input, timeout_sec=5)
-        success = not str(output).startswith("Execution Error") and not str(output).startswith("Syntax Error") and not str(output).startswith("Security Error")
-        return JSONResponse({"output": output, "success": success})
+        output_text = str(output or "")
+        is_error = (
+            output_text.startswith(("Execution Error", "Syntax Error", "Security Error"))
+            or "Traceback (most recent call last):" in output_text
+            or "EOFError" in output_text
+            or "Exception" in output_text
+            or "Error:" in output_text
+        )
+        status = "error" if is_error else "success"
+        stdout = output_text
+        error_details = ""
+        program_output = output_text.strip()
+        if status == "error":
+            error_details = output_text.strip()
+            program_output = ""
+        else:
+            cleaned_lines = []
+            for line in output_text.splitlines():
+                stripped = line.strip()
+                if re.fullmatch(r"Enter\s+.*?:", stripped):
+                    continue
+                if re.fullmatch(r"Enter\s+.*?:\s*", stripped):
+                    continue
+                cleaned_lines.append(line)
+            program_output = "\n".join(part for part in cleaned_lines if part.strip() or part == "").strip()
+            if not program_output:
+                program_output = output_text.strip()
+        return JSONResponse({
+            "output": output_text,
+            "stdout": stdout,
+            "stderr": error_details if status == "error" else "",
+            "status": status,
+            "success": status == "success",
+            "error_details": error_details,
+            "program_output": program_output,
+        })
     except HTTPException:
         raise
     except Exception as e:
