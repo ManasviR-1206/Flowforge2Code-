@@ -27,9 +27,12 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
     Classifies shape contour into flowchart symbol types.
     """
     num_vertices = len(approx)
-    
+    x, y, w, h = cv2.boundingRect(cnt)
+
+    if num_vertices == 3:
+        return "offpage"  # triangle / pentagon-like pointer often 3-approx
+
     if num_vertices == 4:
-        # Measure corner angles
         pts = approx.reshape(4, 2)
         angles = []
         for i in range(4):
@@ -43,19 +46,30 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
             angles.append(angle)
 
         mean_angle = np.mean(angles)
-        
-        if 82 <= mean_angle <= 98 and 0.2 <= aspect_ratio <= 5.0:
-            return "process"  # Rectangle
-        elif 0.75 <= aspect_ratio <= 1.35 and circularity < 0.68:
-            return "decision"  # Diamond
-        else:
-            return "input_output"  # Parallelogram / Slanted shape
+        # Trapezoid (manual input): top edge shorter / slanted
+        xs_top = sorted(pts, key=lambda p: p[1])[:2]
+        top_width = abs(float(xs_top[0][0] - xs_top[1][0]))
+        if top_width < 0.75 * w and 0.4 <= aspect_ratio <= 3.5 and mean_angle < 100:
+            return "manual_input"
 
-    elif num_vertices > 5:
-        if circularity > 0.65:
-            return "start_end"  # Oval / Stadium / Circle
-        else:
+        if 82 <= mean_angle <= 98 and 0.2 <= aspect_ratio <= 5.0:
             return "process"
+        elif 0.75 <= aspect_ratio <= 1.35 and circularity < 0.68:
+            return "decision"
+        else:
+            return "input_output"
+
+    if num_vertices == 5:
+        return "offpage"
+
+    if num_vertices >= 6:
+        if circularity > 0.72 and 0.6 <= aspect_ratio <= 1.8:
+            return "connector" if min(w, h) < 70 and circularity > 0.85 else "start_end"
+        if circularity > 0.65:
+            return "start_end"
+        if aspect_ratio < 0.85:
+            return "database"
+        return "document" if aspect_ratio > 1.2 else "process"
 
     return "unknown"
 
@@ -161,10 +175,16 @@ def detect_connections(thresh_img, blocks):
             end_b = find_nearest_block((x2, y2), blocks)
 
             if start_b and end_b and start_b["id"] != end_b["id"]:
+                branch = ""
+                if start_b.get("type") == "decision":
+                    sx, sy = start_b["center"]
+                    mx = (x1 + x2) / 2
+                    branch = "Yes" if mx < sx else "No"
                 connections.append({
                     "from": start_b["id"],
                     "to": end_b["id"],
-                    "vector": ((x1, y1), (x2, y2))
+                    "vector": ((x1, y1), (x2, y2)),
+                    "branch": branch,
                 })
 
     # Fallback spatial proximity connection if Hough lines miss
@@ -206,10 +226,17 @@ def overlay_detections(img, blocks, connections):
     """
     overlay = img.copy()
     color_map = {
-        "start_end": (0, 255, 0),     # Green
-        "process": (255, 165, 0),      # Blue/Orange
-        "decision": (0, 255, 255),    # Yellow
-        "input_output": (255, 0, 255) # Magenta
+        "start_end": (0, 255, 0),
+        "process": (255, 165, 0),
+        "decision": (0, 255, 255),
+        "input_output": (255, 0, 255),
+        "manual_input": (180, 80, 255),
+        "database": (0, 140, 255),
+        "document": (255, 200, 0),
+        "connector": (180, 180, 180),
+        "offpage": (80, 80, 255),
+        "predefined_process": (255, 100, 80),
+        "delay": (0, 200, 220),
     }
 
     # Draw connection lines

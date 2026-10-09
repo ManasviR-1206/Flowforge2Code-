@@ -44,12 +44,13 @@ def extract_block_text(img, bbox):
     filtered = cv2.bilateralFilter(scaled, 7, 50, 50)
     _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    raw_text = ""
     try:
-        # PSM 6: Assume uniform block of text
-        config = r'--psm 6'
-        raw_text = pytesseract.image_to_string(thresh, config=config)
+        for psm in ("7", "6", "8"):
+            raw_text = pytesseract.image_to_string(thresh, config=f"--psm {psm}")
+            if raw_text.strip():
+                break
     except Exception:
-        # Fallback if tesseract binary is missing
         raw_text = ""
 
     return clean_ocr_text(raw_text)

@@ -37,7 +37,7 @@ export const FeaturesSection: React.FC = () => {
         </svg>
       ),
       title: "Instant In-Browser Sandbox",
-      description: "Test generated Python scripts immediately with mock standard inputs in an isolated runtime environment with 3s safety timeout caps.",
+      description: "Run generated Python with your own stdin in an isolated subprocess, with a timeout and restricted imports.",
     },
     {
       icon: (
