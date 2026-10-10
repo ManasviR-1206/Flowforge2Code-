@@ -44,6 +44,7 @@ GENERIC_LABELS = {
     "input/output",
     "decision",
     "decision?",
+    "condition?",
     "document",
     "pre-defined process",
     "predefined process",
@@ -169,6 +170,8 @@ def sanitize_graph(nodes: list, edges: list) -> tuple[list, list]:
             "label": label,
             "branch": label or None,
         }
+        if isinstance(e.get("data"), dict):
+            item["data"] = copy.deepcopy(e["data"])
         if handle:
             item["sourceHandle"] = handle
         clean_edges.append(item)
@@ -196,6 +199,7 @@ def build_flowchart_ast(nodes_or_blocks, edges_or_connections):
             "to": str(e["target"]),
             "branch": (e.get("label") or None) or None,
             "sourceHandle": e.get("sourceHandle"),
+            "data": copy.deepcopy(e.get("data") or {}),
         })
 
     return {
@@ -275,6 +279,29 @@ def find_join(yes_id: Optional[str], no_id: Optional[str], next_map: dict) -> Op
     return None
 
 
+def find_common_join(start_ids: list[str], next_map: dict) -> Optional[str]:
+    """Find the nearest node reachable from every branch start."""
+    if len(start_ids) < 2:
+        return None
+
+    distances = []
+    for start_id in start_ids:
+        found = {start_id: 0}
+        queue = [start_id]
+        while queue:
+            current = queue.pop(0)
+            for target in next_map.get(current, []):
+                if target not in found:
+                    found[target] = found[current] + 1
+                    queue.append(target)
+        distances.append(found)
+
+    common = set.intersection(*(set(found) for found in distances))
+    if not common:
+        return None
+    return min(common, key=lambda node_id: (max(d[node_id] for d in distances), sum(d[node_id] for d in distances)))
+
+
 def path_reaches(src: Optional[str], dest: str, next_map: dict, limit: int = 80) -> bool:
     if not src:
         return False
@@ -344,6 +371,8 @@ def json_quote(s: str) -> str:
 
 def normalize_condition(text: str) -> str:
     cond = text.replace("?", "").strip()
+    if not cond or cond.lower() in GENERIC_LABELS:
+        raise ValueError("Decision node needs an explicit condition before code can be generated.")
     cond = re.sub(r"^(if|whether|check( if)?)\s+", "", cond, flags=re.I).strip()
 
     replacements = {
@@ -381,7 +410,7 @@ def normalize_condition(text: str) -> str:
             if var_rhs != lhs and not re.search(rf"\b{re.escape(var_rhs)}\b", lhs):
                 cond = cond[:match_rhs.start(1)] + f'{match_rhs.group(1)} "{var_rhs}"'
 
-    # If condition is empty or missing comparison operator
+    # A bare identifier is a valid Boolean condition; do not invent a comparison.
     if not any(op in cond for op in (">", "<", "==", "!=", ">=", "<=", "%", " in ", " not ")):
         ident = extract_identifier(cond, cond or "n")
         if "even" in low:
@@ -389,43 +418,30 @@ def normalize_condition(text: str) -> str:
         elif "odd" in low:
             cond = f"{ident} % 2 != 0"
         elif "prime" in low:
-            cond = "is_prime"
+            raise ValueError("A prime decision needs an explicit Boolean condition in its node label.")
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cond):
+            pass
         else:
-            cond = f"{ident} > 0" if ident else "True"
+            raise ValueError(f"Decision condition is missing or ambiguous: {text!r}.")
 
-    # Fix incomplete trailing comparison operators: e.g. "x ==" or "x >"
-    cond = re.sub(r"(==|!=)\s*$", '== ""', cond)
-    cond = re.sub(r"(>=|<=|>|<)\s*$", r'\1 0', cond)
-
-    # Test syntax with Python AST parser
     try:
-        import ast as py_ast
-        py_ast.parse(f"if {cond}:\n    pass")
-    except SyntaxError:
-        # Fallback repair attempts
-        if "==" in cond:
-            parts = cond.split("==", 1)
-            lhs = parts[0].strip()
-            rhs = parts[1].strip()
-            rhs_quoted = f'"{rhs}"' if not (rhs.startswith('"') or rhs.startswith("'")) else rhs
-            candidate = f"{lhs} == {rhs_quoted}"
-            try:
-                import ast as py_ast
-                py_ast.parse(f"if {candidate}:\n    pass")
-                return candidate
-            except SyntaxError:
-                pass
-        ident = extract_identifier(cond, "n")
-        cond = f"{ident} > 0" if ident else "True"
+        ast.parse(f"if {cond}:\n    pass")
+    except SyntaxError as exc:
+        raise ValueError(f"Decision condition is not valid Python: {text!r}.") from exc
 
     return cond
 
 
 def compile_to_python(ast_data: dict) -> str:
-    """Deterministic Python compiler from flowchart AST. Never invents extra logic."""
+    """Compile the normalized graph deterministically without inventing conditions or edges."""
     nodes, next_map, branch_map, _incoming = _graph_maps(ast_data)
     if not nodes:
         return "# Empty flowchart\n"
+    if any(
+        isinstance(edge.get("data"), dict) and edge["data"].get("uncertain")
+        for edge in ast_data.get("edges", [])
+    ):
+        raise ValueError("Review uncertain image connections before generating Python.")
 
     start = find_start_id(nodes)
     lines: list[str] = []
@@ -480,15 +496,95 @@ def compile_to_python(ast_data: dict) -> str:
                 cond = normalize_condition(text)
                 branches = branch_map.get(nid, {})
                 targets = next_map.get(nid, [])
+                outgoing_edges = [
+                    edge for edge in ast_data.get("edges", [])
+                    if str(edge.get("from")) == nid
+                ]
                 yes_t = branches.get("Yes") or branches.get("True")
                 no_t = branches.get("No") or branches.get("False")
-                if not yes_t and targets:
-                    yes_t = targets[0]
-                if not no_t:
-                    for t in targets:
-                        if t != yes_t:
-                            no_t = t
-                            break
+
+                if len(outgoing_edges) > 2 or (len(outgoing_edges) == 2 and not (yes_t and no_t)):
+                    variable_match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\??\s*", text)
+                    if not variable_match:
+                        raise ValueError(
+                            f"Decision {nid!r} has multiple labeled paths but no single selector variable."
+                        )
+
+                    cases = []
+                    default_target = None
+                    used_labels = set()
+                    for edge in outgoing_edges:
+                        label = str(edge.get("branch") or edge.get("label") or "").strip()
+                        handle = str(edge.get("sourceHandle") or "").strip()
+                        if not label:
+                            label = handle
+                        target = str(edge.get("to") or edge.get("target") or "")
+                        if not label or not target:
+                            raise ValueError(
+                                f"Decision {nid!r} has an unlabeled outgoing path; label each branch before generating code."
+                            )
+                        if label.lower() in ("default", "else", "otherwise", "other"):
+                            if default_target is not None:
+                                raise ValueError(f"Decision {nid!r} has more than one default branch.")
+                            default_target = target
+                            continue
+
+                        case_value = label
+                        case_match = re.match(r"^case\s+(.+)$", label, re.I)
+                        if case_match:
+                            case_value = case_match.group(1).strip()
+                        try:
+                            literal = ast.literal_eval(case_value)
+                            if not isinstance(literal, (str, int, float, bool)):
+                                raise ValueError
+                        except (ValueError, SyntaxError):
+                            literal = case_value
+                            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", literal):
+                                literal = json_quote(case_value)
+                            elif literal.lower() in ("true", "false"):
+                                literal = literal.title()
+                            else:
+                                literal = json_quote(case_value)
+                        else:
+                            literal = repr(literal)
+
+                        normalized_label = str(literal)
+                        if normalized_label in used_labels:
+                            raise ValueError(f"Decision {nid!r} contains duplicate branch label {label!r}.")
+                        used_labels.add(normalized_label)
+                        cases.append((label, target, f"{variable_match.group(1)} == {literal}"))
+
+                    if not cases:
+                        raise ValueError(f"Decision {nid!r} has no labeled cases.")
+                    if default_target in [target for _, target, _ in cases]:
+                        raise ValueError(f"Decision {nid!r} reuses a target for a case and default path.")
+
+                    branch_starts = [target for _, target, _ in cases]
+                    if default_target:
+                        branch_starts.append(default_target)
+                    join = find_common_join(branch_starts, next_map)
+                    for index, (_label, target, case_condition) in enumerate(cases):
+                        keyword = "if" if index == 0 else "elif"
+                        lines.append(f"{indent}{keyword} {case_condition}:")
+                        if target != join:
+                            process_flow(target, indent + "    ", join, stack + (nid,))
+                        else:
+                            lines.append(f"{indent}    pass")
+                    if default_target:
+                        lines.append(f"{indent}else:")
+                        if default_target != join:
+                            process_flow(default_target, indent + "    ", join, stack + (nid,))
+                        else:
+                            lines.append(f"{indent}    pass")
+                    if join:
+                        nid = join
+                        continue
+                    return
+
+                if not yes_t or not no_t:
+                    raise ValueError(
+                        f"Decision {nid!r} must have explicitly labeled Yes/No branches or labeled selector cases."
+                    )
 
                 yes_loops = path_reaches(yes_t, nid, next_map)
                 no_loops = path_reaches(no_t, nid, next_map)
@@ -542,22 +638,7 @@ def compile_to_python(ast_data: dict) -> str:
         lines = ["# Flowchart produced no executable steps"]
 
     code = "\n".join(lines) + "\n"
-    try:
-        import ast as py_ast
-        py_ast.parse(code)
-    except SyntaxError:
-        repaired_lines = []
-        for line in lines:
-            if line.strip().startswith("if ") or line.strip().startswith("while "):
-                indent_str = line[:len(line) - len(line.lstrip())]
-                parts = line.strip().split(" ", 1)
-                kw = parts[0]
-                rest = parts[1].rstrip(":").strip() if len(parts) > 1 else "True"
-                safe_cond = normalize_condition(rest)
-                repaired_lines.append(f"{indent_str}{kw} {safe_cond}:")
-            else:
-                repaired_lines.append(line)
-        code = "\n".join(repaired_lines) + "\n"
+    ast.parse(code)
 
     return code
 

@@ -119,10 +119,11 @@ NODE_TYPE_MAP = {
 }
 
 
-def blocks_to_react_nodes(blocks, img_height=500, img_width=400) -> list:
+def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=None) -> list:
     nodes = []
+    incoming = {str(connection["to"]) for connection in connections or []}
+    outgoing = {str(connection["from"]) for connection in connections or []}
     placeholder_labels = {
-        "start_end": "Start / End",
         "input_output": "Unlabeled input/output",
         "decision": "Unlabeled decision",
         "process": "Unlabeled process",
@@ -136,7 +137,12 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400) -> list:
         cy = b.get("center", (img_width // 2, (i + 1) * 100))[1]
         if not text:
             if shape_type == "start_end":
-                text = "Start" if cy <= img_height / 2 else "End"
+                if str(b["id"]) not in incoming and str(b["id"]) in outgoing:
+                    text = "Start"
+                elif str(b["id"]) in incoming and str(b["id"]) not in outgoing:
+                    text = "End"
+                else:
+                    text = "Unlabeled start/end"
             else:
                 text = placeholder_labels.get(shape_type, "Unlabeled flowchart step")
         x = int((cx / max(img_width, 1)) * 550) + 50
@@ -162,6 +168,10 @@ def connections_to_react_edges(connections) -> list:
             "type": "smoothstep",
             "animated": True,
             "label": label,
+            "data": {
+                "confidence": c.get("confidence", 1.0),
+                "uncertain": bool(c.get("uncertain")),
+            },
         }
         if handle:
             e["sourceHandle"] = handle
@@ -256,7 +266,7 @@ async def analyze(
         if not blocks:
             raise HTTPException(422, "No flowchart symbols detected. Please ensure the image contains clear shapes.")
 
-        connections = cv_engine.detect_connections(thresh, blocks)
+        connections, connection_warnings = cv_engine.detect_connections(thresh, blocks)
 
         ocr_failed = 0
         for b in blocks:
@@ -268,10 +278,27 @@ async def analyze(
                 b["text"] = ""
                 ocr_failed += 1
 
+        if ocr_engine.tesseract_available():
+            blocks_by_id = {int(block["id"]): block for block in blocks}
+            for connection in connections:
+                start_block = blocks_by_id.get(int(connection["from"]))
+                end_block = blocks_by_id.get(int(connection["to"]))
+                if not start_block or start_block.get("type") != "decision" or connection.get("branch"):
+                    continue
+                sx, sy = start_block["center"]
+                tx, ty = end_block["center"]
+                for fraction in (0.3, 0.5, 0.7):
+                    x = int(sx + (tx - sx) * fraction)
+                    y = int(sy + (ty - sy) * fraction)
+                    label = ocr_engine.extract_region_text(norm_img, (x - 36, y - 22, 72, 44))
+                    if label:
+                        connection["branch"] = label
+                        break
+
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
         overlay_b64 = img_to_b64(overlay)
 
-        react_nodes = blocks_to_react_nodes(blocks, img_height=h, img_width=w)
+        react_nodes = blocks_to_react_nodes(blocks, img_height=h, img_width=w, connections=connections)
         react_edges = connections_to_react_edges(connections)
 
         blocks_json = [
@@ -279,14 +306,36 @@ async def analyze(
              "bbox": list(b["bbox"]), "center": list(b["center"])}
             for b in blocks
         ]
-        connections_json = [{"from": c["from"], "to": c["to"], "branch": c.get("branch", "")} for c in connections]
+        connections_json = [
+            {
+                "from": c["from"],
+                "to": c["to"],
+                "branch": c.get("branch", ""),
+                "confidence": c.get("confidence", 1.0),
+                "uncertain": bool(c.get("uncertain")),
+            }
+            for c in connections
+        ]
 
-        warning = None
-        if ocr_failed:
-            warning = (
+        warnings = list(connection_warnings)
+        if not ocr_engine.tesseract_available():
+            warnings.append(
+                "Tesseract OCR is unavailable; node and branch labels could not be read. "
+                "Install Tesseract OCR and retry, or review and edit the detected nodes manually."
+            )
+        elif ocr_failed:
+            warnings.append(
                 f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes. "
                 "Please review and edit those node labels on the canvas."
             )
+        decision_ids = {str(block["id"]) for block in blocks if block.get("type") == "decision"}
+        for decision_id in decision_ids:
+            decision_edges = [edge for edge in connections if str(edge["from"]) == decision_id]
+            if len(decision_edges) > 1 and any(not edge.get("branch") for edge in decision_edges):
+                warnings.append(
+                    f"Branch labels from decision {decision_id} could not be read; review these paths before generating code."
+                )
+        warning = " ".join(dict.fromkeys(warnings)) or None
 
         return JSONResponse({
             "nodes": react_nodes,
@@ -295,6 +344,7 @@ async def analyze(
             "connections": connections_json,
             "overlay_image": overlay_b64,
             "warning": warning,
+            "warnings": list(dict.fromkeys(warnings)),
         })
     except HTTPException:
         raise
@@ -368,6 +418,15 @@ async def generate_code(request_body: dict):
                 422,
                 "Some imported flowchart labels could not be read. Edit the highlighted or unlabeled nodes, then generate Python again.",
             )
+        uncertain_edges = [
+            edge for edge in edges
+            if isinstance(edge.get("data"), dict) and edge["data"].get("uncertain")
+        ]
+        if uncertain_edges:
+            raise HTTPException(
+                422,
+                "Some imported connections have uncertain arrow direction. Review or reconnect the dashed edges before generating Python.",
+            )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
         code = llm_generator.generate_python_code(ast_data, GEMINI_API_KEY or None)
 
@@ -390,6 +449,8 @@ async def generate_code(request_body: dict):
         return JSONResponse({"code": code, "ast": ast_data, "warnings": warnings})
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(422, f"The current flowchart cannot be compiled safely: {str(e)}")
     except Exception as e:
         raise HTTPException(500, f"Code generation failed: {str(e)}")
 

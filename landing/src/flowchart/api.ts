@@ -23,6 +23,7 @@ export function graphPayload(nodes: any[], edges: any[]) {
       target: e.target,
       label: e.label || '',
       sourceHandle: e.sourceHandle,
+      data: e.data?.uncertain ? { uncertain: true, confidence: e.data.confidence } : undefined,
       type: 'smoothstep',
       animated: true,
     })),

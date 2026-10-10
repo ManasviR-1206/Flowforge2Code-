@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import Counter, defaultdict
 from PIL import Image
 
 def normalize_image(image_input, target_max_dim=1280):
@@ -53,10 +54,15 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
         bottom_level = abs(int(bottom[0][1]) - int(bottom[1][1])) <= 0.2 * h
         top_width = abs(float(top[0][0] - top[1][0]))
         bottom_width = abs(float(bottom[0][0] - bottom[1][0]))
+        top_center_x = sum(float(point[0]) for point in top) / 2
+        bottom_center_x = sum(float(point[0]) for point in bottom) / 2
+        side_skew = abs(top_center_x - bottom_center_x)
 
         if top_level and bottom_level and min(top_width, bottom_width) < 0.8 * max(top_width, bottom_width):
             return "manual_input"
 
+        if top_level and bottom_level and side_skew > max(3, 0.05 * w):
+            return "input_output"
         if max(abs(angle - 90) for angle in angles) <= 15 and 0.2 <= aspect_ratio <= 5.0:
             return "process"
         side_ratio = max(side_lengths) / max(min(side_lengths), 1e-5)
@@ -158,7 +164,16 @@ def filter_overlapping_blocks(blocks):
         overlap_height = max(0, min(y + h, iy + ih) - max(y, iy))
         overlap_area = overlap_width * overlap_height
         smaller_area = min(w * h, iw * ih)
-        return smaller_area > 0 and overlap_area >= smaller_area * 0.25
+        return smaller_area > 0 and overlap_area >= smaller_area * 0.18
+
+    for block in blocks:
+        if block["type"] == "offpage" and any(
+            candidate is not block
+            and candidate["type"] != "offpage"
+            and significantly_overlaps(block, candidate)
+            for candidate in blocks
+        ):
+            aggregate_ids.add(id(block))
 
     for block in blocks:
         _, _, width, height = block["bbox"]
@@ -179,7 +194,11 @@ def filter_overlapping_blocks(blocks):
             )
             if separated:
                 distinct.append(candidate)
-        if len(distinct) >= 2:
+        has_embedded_symbol = any(
+            candidate["bbox"][2] * candidate["bbox"][3] < bbox_area * 0.75
+            for candidate in distinct
+        )
+        if len(distinct) >= 2 or has_embedded_symbol:
             aggregate_ids.add(id(block))
 
     kept = []
@@ -198,55 +217,103 @@ def filter_overlapping_blocks(blocks):
 
 def detect_connections(thresh_img, blocks):
     """
-    Detects directional connections between blocks using line vectors and spatial proximity.
+    Detects line endpoints near nodes and infers arrow direction from arrowhead
+    pixel density. Connections without clear directional evidence are flagged.
     """
     connections = []
+    warnings = []
     if len(blocks) < 2:
-        return connections
+        return connections, warnings
 
-    # Mask symbol areas to isolate arrow shafts
+    # Leave arrowheads outside symbol borders visible for direction scoring.
     mask = thresh_img.copy()
     for block in blocks:
         x, y, w, h = block["bbox"]
-        cv2.rectangle(mask, (max(0, x - 8), max(0, y - 8)), (x + w + 8, y + h + 8), 0, -1)
+        cv2.rectangle(mask, (max(0, x - 2), max(0, y - 2)), (x + w + 2, y + h + 2), 0, -1)
 
     lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=10)
+    votes: dict[tuple[int, int], Counter] = defaultdict(Counter)
+    vectors: dict[tuple[int, int], dict[tuple[int, int], tuple]] = defaultdict(dict)
+    unresolved_pairs = set()
+    seen_segments = set()
 
     if lines is not None:
         for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
-            start_b = find_nearest_block((x1, y1), blocks)
-            end_b = find_nearest_block((x2, y2), blocks)
+            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+            segment = tuple(sorted(((x1, y1), (x2, y2))))
+            if segment in seen_segments:
+                continue
+            seen_segments.add(segment)
 
-            if start_b and end_b and start_b["id"] != end_b["id"]:
-                # Hough segments are undirected; flowcharts are laid out top-to-bottom.
-                if start_b["center"][1] > end_b["center"][1]:
-                    start_b, end_b = end_b, start_b
-                branch = ""
-                if start_b.get("type") == "decision":
-                    sx = start_b["center"][0]
-                    tx, _ = end_b["center"]
-                    branch_offset = max(12, start_b["bbox"][2] * 0.2)
-                    if tx < sx - branch_offset:
-                        branch = "Yes"
-                    elif tx > sx + branch_offset:
-                        branch = "No"
-                connections.append({
-                    "from": start_b["id"],
-                    "to": end_b["id"],
-                    "vector": ((x1, y1), (x2, y2)),
-                    "branch": branch,
-                })
+            first = find_nearest_block((x1, y1), blocks, max_dist=35)
+            second = find_nearest_block((x2, y2), blocks, max_dist=35)
+            if not first or not second or first["id"] == second["id"]:
+                continue
 
-    # Fallback spatial proximity connection if Hough lines miss
-    if not connections:
-        for i in range(len(blocks) - 1):
+            def endpoint_ink(x: int, y: int) -> int:
+                radius = 5
+                crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
+                return int(np.count_nonzero(crop))
+
+            first_ink = endpoint_ink(x1, y1)
+            second_ink = endpoint_ink(x2, y2)
+            pair = tuple(sorted((int(first["id"]), int(second["id"]))))
+            if abs(first_ink - second_ink) < 8:
+                if np.hypot(x2 - x1, y2 - y1) >= 30:
+                    unresolved_pairs.add(pair)
+                continue
+
+            if first_ink > second_ink:
+                source, target = second, first
+                vector = ((x2, y2), (x1, y1))
+            else:
+                source, target = first, second
+                vector = ((x1, y1), (x2, y2))
+            pair = tuple(sorted((int(source["id"]), int(target["id"]))))
+            direction = (int(source["id"]), int(target["id"]))
+            votes[pair][direction] += 1
+            vectors[pair][direction] = vector
+
+    for pair, direction_votes in votes.items():
+        total = sum(direction_votes.values())
+        ranked = direction_votes.most_common()
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1] and ranked[0][1] >= 2:
+            directions = [direction for direction, count in ranked if count >= 2]
+        else:
+            directions = [ranked[0][0]]
+
+        for direction in directions:
+            count = direction_votes[direction]
+            confidence = count / total
+            uncertain = total < 2 or confidence < 0.67
             connections.append({
-                "from": blocks[i]["id"],
-                "to": blocks[i + 1]["id"],
-                "vector": (blocks[i]["center"], blocks[i + 1]["center"])
+                "from": direction[0],
+                "to": direction[1],
+                "vector": vectors[pair][direction],
+                "branch": "",
+                "confidence": round(confidence, 2),
+                "uncertain": uncertain,
             })
+            if uncertain:
+                warnings.append(
+                    f"Arrow direction between shapes {direction[0]} and {direction[1]} is uncertain; review this connection."
+                )
 
-    return deduplicate_connections(connections)
+    if not connections:
+        warnings.append("No directed arrows could be reconstructed confidently. Connect the detected nodes manually.")
+    detected_pairs = {tuple(sorted((int(edge["from"]), int(edge["to"])))) for edge in connections}
+    for first_id, second_id in unresolved_pairs - detected_pairs:
+        warnings.append(
+            f"A possible connection between shapes {first_id} and {second_id} has no clear arrow direction; review it manually."
+        )
+    connected_ids = {
+        int(node_id)
+        for edge in connections
+        for node_id in (edge["from"], edge["to"])
+    }
+    if connections and any(int(block["id"]) not in connected_ids for block in blocks):
+        warnings.append("Some detected shapes have no confirmed arrow connection; review the graph before generating code.")
+    return connections, warnings
 
 def find_nearest_block(point, blocks, max_dist=120):
     px, py = point
@@ -266,7 +333,7 @@ def deduplicate_connections(connections):
     seen = set()
     unique = []
     for c in connections:
-        pair = (c["from"], c["to"])
+        pair = (c["from"], c["to"], c.get("branch") or "")
         if pair not in seen:
             seen.add(pair)
             unique.append(c)

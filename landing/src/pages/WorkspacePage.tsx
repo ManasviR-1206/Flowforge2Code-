@@ -2,13 +2,13 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactFlow, {
   Background,
-  MiniMap,
   ReactFlowProvider,
   addEdge,
   applyNodeChanges,
   applyEdgeChanges,
-  useReactFlow,
   MarkerType,
+  useReactFlow,
+  useUpdateNodeInternals,
 } from 'reactflow';
 import type { Node, Edge, Connection, NodeChange, EdgeChange } from 'reactflow';
 import 'reactflow/dist/style.css';
@@ -47,11 +47,54 @@ const nextNodeId = (nodes: Node[]) => {
   return `node_${max + 1}`;
 };
 
+const nodeDimensions: Record<string, { width: number; height: number }> = {
+  start_end: { width: 120, height: 44 },
+  process: { width: 140, height: 48 },
+  input_output: { width: 140, height: 44 },
+  decision: { width: 140, height: 90 },
+  document: { width: 140, height: 56 },
+  predefined_process: { width: 150, height: 48 },
+  database: { width: 120, height: 58 },
+  manual_input: { width: 140, height: 48 },
+  connector: { width: 60, height: 60 },
+  offpage: { width: 120, height: 52 },
+  delay: { width: 120, height: 48 },
+  arrow: { width: 60, height: 40 },
+};
+
+const withNodeDimensions = (node: Node): Node => {
+  const fallback = nodeDimensions[node.type || ''] || { width: 140, height: 48 };
+  return {
+    ...node,
+    width: node.width || fallback.width,
+    height: node.height || fallback.height,
+  };
+};
+
 const WorkspaceCanvas = ({
   nodes, edges, onNodesChange, onEdgesChange, onConnect, onReconnect,
-  onDrop, onDragOver, setInstance, errorNodeIds, onNodeDragStop,
+  onDrop, onDragOver, setInstance, onViewportMoveStart, errorNodeIds, onNodeDragStart, onNodeDragStop,
+  fitKey,
 }: any) => {
   const { fitView } = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
+  useEffect(() => {
+    if (!nodes.length) return;
+    let fitFrame = 0;
+    const measureFrame = requestAnimationFrame(() => {
+      updateNodeInternals(nodes.map((node: Node) => node.id));
+      fitFrame = requestAnimationFrame(() => {
+        fitFrame = requestAnimationFrame(() => {
+          fitView({ padding: 0.18, minZoom: 0.05, maxZoom: 1.5, duration: 200 });
+        });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(measureFrame);
+      cancelAnimationFrame(fitFrame);
+    };
+  }, [fitKey, fitView, nodes.length, updateNodeInternals]);
+
   const styledNodes = nodes.map((n: Node) => ({
     ...n,
     data: { ...n.data, hasError: errorNodeIds?.includes(n.id) },
@@ -64,20 +107,23 @@ const WorkspaceCanvas = ({
       onEdgesChange={onEdgesChange}
       onConnect={onConnect}
       onReconnect={onReconnect}
+      minZoom={0.05}
+      maxZoom={2.5}
       onNodeDragStop={onNodeDragStop}
-      onInit={inst => { setInstance(inst); setTimeout(() => fitView({ padding: 0.15, duration: 300 }), 80); }}
+      onNodeDragStart={onNodeDragStart}
+      onInit={setInstance}
+      onMoveStart={onViewportMoveStart}
       onDrop={onDrop}
       onDragOver={onDragOver}
       nodeTypes={nodeTypes}
       defaultEdgeOptions={{ type: 'smoothstep', animated: true, markerEnd: { type: MarkerType.ArrowClosed, color: '#94a3b8' }, style: { stroke: '#94a3b8', strokeWidth: 2 } }}
       fitView
+      fitViewOptions={{ padding: 0.18, minZoom: 0.05, maxZoom: 1.5 }}
       className="bg-transparent"
       deleteKeyCode={['Backspace', 'Delete']}
       multiSelectionKeyCode="Shift"
     >
       <Background color="#1e293b" gap={24} size={1.5} />
-      <MiniMap style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8 }}
-        nodeColor={(n) => n.type === 'start_end' ? '#34d399' : n.type === 'decision' ? '#fbbf24' : n.type === 'input_output' ? '#c084fc' : '#60a5fa'} />
     </ReactFlow>
   );
 };
@@ -139,6 +185,12 @@ export const WorkspacePage: React.FC = () => {
   const [runOpen, setRunOpen] = useState(true);
   const [aiBanner, setAiBanner] = useState('');
   const [zoomPct, setZoomPct] = useState(100);
+  const [fitRevision, setFitRevision] = useState(0);
+  const graphFitKey = JSON.stringify({
+    nodes: nodes.map(node => [node.id, node.type]),
+    edges: edges.map(edge => [edge.id, edge.source, edge.target, edge.label]),
+  });
+  const userViewportTouchedRef = useRef(false);
   const canvasWrapRef = useRef<HTMLDivElement>(null);
   const outputEndRef = useRef<HTMLDivElement>(null);
 
@@ -150,8 +202,32 @@ export const WorkspacePage: React.FC = () => {
     });
   }, []);
 
+  useEffect(() => {
+    userViewportTouchedRef.current = false;
+  }, [graphFitKey, fitRevision]);
+
+  useEffect(() => {
+    const container = canvasWrapRef.current;
+    if (!container || typeof ResizeObserver === 'undefined') return;
+    let previousSize: { width: number; height: number } | null = null;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      if (
+        (!previousSize || previousSize.width !== width || previousSize.height !== height) &&
+        nodes.length > 0 &&
+        !userViewportTouchedRef.current
+      ) {
+        setFitRevision(revision => revision + 1);
+      }
+      previousSize = { width, height };
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [nodes.length]);
+
   const addLabelChange = useCallback((nid: string, newLabel: string) => {
     setNodes(prev => prev.map(n => n.id === nid ? { ...n, data: { ...n.data, label: newLabel } } : n));
+    setFitRevision(revision => revision + 1);
   }, []);
 
   const snapshot = useCallback(() => {
@@ -187,7 +263,12 @@ export const WorkspacePage: React.FC = () => {
   const setEdgeBranch = (edgeId: string, label: string) => {
     snapshot();
     const handle = label === 'Yes' ? 'yes' : label === 'No' ? 'no' : undefined;
-    setEdges(eds => eds.map(e => e.id === edgeId ? { ...e, label, sourceHandle: handle, ...edgeLook(label) } : e));
+    setEdges(eds => eds.map(e => e.id === edgeId ? {
+      ...e,
+      label,
+      sourceHandle: handle,
+      ...edgeLook(label),
+    } : e));
   };
 
   const onDragOver = useCallback((e: React.DragEvent) => {
@@ -205,12 +286,12 @@ export const WorkspacePage: React.FC = () => {
 
   const addNode = (type: string, position?: { x: number; y: number }) => {
     snapshot();
-    const newNode: Node = {
+    const newNode: Node = withNodeDimensions({
       id: nextNodeId(nodes),
       type,
       position: position || { x: 220 + Math.random() * 160, y: 80 + nodes.length * 70 },
       data: { label: defaultLabelFor(type), onLabelChange: addLabelChange },
-    };
+    });
     setNodes(ns => [...ns, newNode]);
   };
 
@@ -269,10 +350,19 @@ export const WorkspacePage: React.FC = () => {
 
   const loadFlowchart = useCallback((newNodes: Node[], newEdges: Edge[]) => {
     snapshot();
-    const enriched = newNodes.map(n => ({ ...n, data: { ...(n.data || {}), onLabelChange: addLabelChange } }));
+    const enriched = newNodes.map(n => ({
+      ...withNodeDimensions(n),
+      data: { ...(n.data || {}), onLabelChange: addLabelChange },
+    }));
     const enrichedEdges = newEdges.map(e => {
       const lbl = String(e.label || '');
-      return { ...e, ...edgeLook(lbl), label: lbl };
+      const look = edgeLook(lbl);
+      return {
+        ...e,
+        ...look,
+        style: e.data?.uncertain ? { ...look.style, strokeDasharray: '6 4' } : look.style,
+        label: lbl,
+      };
     });
     setNodes(enriched);
     setEdges(enrichedEdges);
@@ -283,8 +373,8 @@ export const WorkspacePage: React.FC = () => {
     setDebugIssues([]);
     setDebugSummary('');
     setErrorNodeIds([]);
-    setTimeout(() => rfInstance?.fitView({ padding: 0.12, duration: 400 }), 160);
-  }, [addLabelChange, snapshot, rfInstance]);
+    setFitRevision(revision => revision + 1);
+  }, [addLabelChange, snapshot]);
 
   const applyPatch = (patch: any) => {
     if (!patch) return;
@@ -548,8 +638,22 @@ export const WorkspacePage: React.FC = () => {
   const setZoom = (pct: number) => {
     const z = Math.max(0.2, Math.min(2.5, pct / 100));
     setZoomPct(Math.round(z * 100));
+    userViewportTouchedRef.current = true;
     rfInstance?.zoomTo?.(z);
   };
+
+  const fitCanvas = () => {
+    userViewportTouchedRef.current = false;
+    setFitRevision(revision => revision + 1);
+  };
+
+  const onViewportMoveStart = useCallback((event: MouseEvent | TouchEvent | null) => {
+    if (event) userViewportTouchedRef.current = true;
+  }, []);
+
+  const onNodeDragStart = useCallback(() => {
+    userViewportTouchedRef.current = true;
+  }, []);
 
   const selectedNode = nodes.find(n => n.selected);
   const selectedEdge = edges.find(e => e.selected);
@@ -627,7 +731,7 @@ export const WorkspacePage: React.FC = () => {
         <div className="px-4 py-2 text-xs bg-amber-950/80 border-b border-amber-700/50 text-amber-200">{aiBanner} Manual drawing, debugger structure checks, and code execution still work.</div>
       )}
 
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className="flex flex-1 min-h-0 overflow-hidden relative">
         {(symbolsOpen || rightOpen) && (
           <button type="button" aria-label="Close panels" onClick={() => { setSymbolsOpen(false); setRightOpen(false); }}
             className="lg:hidden absolute inset-0 z-20 bg-black/50" />
@@ -672,6 +776,14 @@ export const WorkspacePage: React.FC = () => {
                   </button>
                 ))}
               </div>
+              <input
+                key={selectedEdge.id}
+                defaultValue={String(selectedEdge.label || '')}
+                onBlur={e => setEdgeBranch(selectedEdge.id, e.target.value.trim())}
+                placeholder="Custom branch label"
+                aria-label="Custom branch label"
+                className="w-full bg-slate-900 border border-slate-700 text-[10px] rounded px-2 py-1.5 outline-none focus:border-cyan-500"
+              />
             </div>
           )}
           <div className="p-3 border-t border-white/10 space-y-2">
@@ -695,7 +807,7 @@ export const WorkspacePage: React.FC = () => {
           </div>
         </aside>
 
-        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+        <div className="flex-1 flex flex-col overflow-hidden min-w-0 min-h-0">
           <div className="flex items-center gap-1 px-2 py-2 border-b border-white/10 bg-slate-950/40 shrink-0 flex-wrap">
             <div className="flex items-center gap-1 rounded-lg bg-slate-900 p-0.5 border border-slate-800 mr-1">
               {([['draw', 'Draw'], ['upload', 'Upload'], ['ai', 'AI Generate']] as const).map(([m, lab]) => (
@@ -715,7 +827,7 @@ export const WorkspacePage: React.FC = () => {
             <button onClick={() => setZoom(zoomPct - 10)} className={toolBtn}>Zoom −</button>
             <button onClick={() => setZoom(100)} className={toolBtn}>{zoomPct}%</button>
             <button onClick={() => setZoom(zoomPct + 10)} className={toolBtn}>Zoom +</button>
-            <button onClick={() => rfInstance?.fitView({ padding: 0.12, duration: 250 })} className={toolBtn}>Fit</button>
+            <button onClick={fitCanvas} className={toolBtn}>Fit</button>
             <div className="flex-1" />
             <button onClick={handleGenerateCode} disabled={loadingCode || !nodes.length}
               className="px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-cyan-600 to-blue-600 disabled:opacity-50 shadow-[0_0_10px_rgba(6,182,212,0.35)]">
@@ -769,29 +881,34 @@ export const WorkspacePage: React.FC = () => {
             </div>
           )}
 
-          <div ref={canvasWrapRef} className={`flex-1 relative overflow-hidden ${mode !== 'draw' ? 'hidden' : ''}`}>
-            <ReactFlowProvider>
-              <WorkspaceCanvas
-                nodes={nodes} edges={edges}
-                onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
-                onReconnect={onReconnect}
-                onDrop={onDrop} onDragOver={onDragOver} setInstance={setRfInstance}
-                errorNodeIds={errorNodeIds}
-                onNodeDragStop={() => snapshot()}
-              />
-            </ReactFlowProvider>
-            {!nodes.length && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <div className="text-center space-y-1">
-                  <p className="text-slate-500 text-sm font-semibold">Canvas is empty</p>
-                  <p className="text-slate-600 text-xs">Add symbols, upload an image, or use AI Generate</p>
+          {mode === 'draw' && (
+            <div ref={canvasWrapRef} className="flex-1 min-h-0 relative overflow-hidden">
+              <ReactFlowProvider>
+                <WorkspaceCanvas
+                  nodes={nodes} edges={edges}
+                  fitKey={`${graphFitKey}-${fitRevision}`}
+                  onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
+                  onReconnect={onReconnect}
+                  onDrop={onDrop} onDragOver={onDragOver} setInstance={setRfInstance}
+                  onViewportMoveStart={onViewportMoveStart}
+                  errorNodeIds={errorNodeIds}
+                  onNodeDragStart={onNodeDragStart}
+                  onNodeDragStop={() => snapshot()}
+                />
+              </ReactFlowProvider>
+              {!nodes.length && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="text-center space-y-1">
+                    <p className="text-slate-500 text-sm font-semibold">Canvas is empty</p>
+                    <p className="text-slate-600 text-xs">Add symbols, upload an image, or use AI Generate</p>
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
         </div>
 
-        <aside className={`${rightOpen ? 'flex' : 'hidden'} lg:flex absolute lg:static z-30 inset-y-0 right-0 w-[min(100%,22rem)] shrink-0 flex-col border-l border-white/10 bg-slate-950/95 lg:bg-slate-950/60 overflow-y-auto`}>
+        <aside className={`${rightOpen ? 'flex' : 'hidden'} lg:flex absolute lg:static z-30 inset-y-0 right-0 w-[min(100%,22rem)] min-h-0 shrink-0 flex-col border-l border-white/10 bg-slate-950/95 lg:bg-slate-950/60 overflow-y-auto`}>
           <div className="flex flex-col border-b border-white/10 shrink-0" style={{ maxHeight: chatOpen ? '300px' : 'auto' }}>
             <div className="p-3 border-b border-white/10 flex items-center justify-between bg-slate-950/40">
               <span className="text-xs font-bold text-violet-400">ARIA — FlowForge AI Assistant</span>

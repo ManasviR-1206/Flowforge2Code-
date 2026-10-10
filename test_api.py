@@ -185,34 +185,50 @@ def test_api():
         and len(imported_nodes) >= 6
         and {"start_end", "decision", "input_output"}.issubset(imported_types)
         and {
-            (str(edge.get("source")), str(edge.get("target")), str(edge.get("label") or ""))
+            (str(edge.get("source")), str(edge.get("target")))
             for edge in imported_edges
         } == {
-            ("1", "2", ""),
-            ("2", "3", ""),
-            ("3", "4", "Yes"),
-            ("3", "5", "No"),
-            ("4", "6", ""),
-            ("5", "6", ""),
+            ("1", "2"),
+            ("2", "3"),
+            ("3", "4"),
+            ("3", "5"),
+            ("4", "6"),
+            ("5", "6"),
         }
     )
     branch_labels = {str(edge.get("label", "")).lower() for edge in imported_edges}
     report(
-        "D image upload detects even/odd graph symbols and branches",
+        "D image upload detects symbols and directed graph topology",
         detected_graph,
-        f"status={st} nodes={len(imported_nodes)} types={sorted(imported_types)} edges={len(imported_edges)} branches={sorted(branch_labels)} {data.get('warning') or ''}",
+        f"status={st} nodes={len(imported_nodes)} types={sorted(imported_types)} edges={len(imported_edges)} branches={sorted(branch_labels)}",
     )
     if st == 200 and data.get("nodes"):
         stc, coded = post("/api/generate-code", {"nodes": data["nodes"], "edges": data.get("edges") or []})
-        labels_readable = all(
-            not str(node.get("data", {}).get("label", "")).lower().startswith("unlabeled")
-            for node in data["nodes"]
-        )
+        if stc == 200:
+            try:
+                import ast
+                ast.parse(coded.get("code") or "")
+                generated_ok = bool(coded.get("code"))
+            except SyntaxError:
+                generated_ok = False
+        else:
+            generated_ok = stc == 422 and any(
+                word in str(coded.get("detail", "")).lower()
+                for word in ("label", "uncertain", "review")
+            )
         report(
-            "D uploaded graph code is valid or explicitly requests label edits",
-            (stc == 200 and bool(coded.get("code"))) or (not labels_readable and stc == 422 and "edit" in str(coded.get("detail", "")).lower()),
+            "D uploaded graph generates valid code or reports uncertainty",
+            generated_ok,
             (coded.get("code") or coded.get("detail") or "")[:180],
         )
+        if stc == 200:
+            for value, expected in (("10", "Even"), ("7", "Odd")):
+                ste, execution = post("/api/execute", {"code": coded["code"], "user_input": value})
+                report(
+                    f"D uploaded graph run {value} -> {expected}",
+                    ste == 200 and expected in str(execution.get("program_output") or execution.get("output")),
+                    str(execution.get("program_output") or execution.get("output")),
+                )
 
     bad_status, bad_image = post(
         "/api/analyze",

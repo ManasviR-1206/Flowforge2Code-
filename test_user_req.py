@@ -70,6 +70,12 @@ def post(path: str, payload: dict):
     with urllib.request.urlopen(req, timeout=10) as res:
         return res.status, json.loads(res.read())
 
+
+def report(name: str, ok: bool, detail: str = ""):
+    print(("✓ " if ok else "✗ ") + name + ((": " + detail) if detail else ""))
+    assert ok, name + ((": " + detail) if detail else "")
+
+
 def run_tests():
     print("=== Testing Calculator Flowchart Code Generation & Syntax ===")
     ast_data = logic_engine.build_flowchart_ast(CALC_GRAPH["nodes"], CALC_GRAPH["edges"])
@@ -109,6 +115,64 @@ def run_tests():
     eo_out_odd = executor.run_code_safely(eo_code, "7")
     print("Output for '7':", repr(eo_out_odd))
     assert "Odd" in eo_out_odd, f"Expected Odd in output, got: {eo_out_odd}"
+
+    print("\n=== Testing Loop and Labeled Multi-Branch Compilation ===")
+    loop_nodes = [
+        {"id": "s", "type": "start_end", "data": {"label": "Start"}},
+        {"id": "i", "type": "input_output", "data": {"label": "Input n"}},
+        {"id": "d", "type": "decision", "data": {"label": "n < 3"}},
+        {"id": "p", "type": "process", "data": {"label": "n += 1"}},
+        {"id": "o", "type": "input_output", "data": {"label": "Print n"}},
+        {"id": "e", "type": "start_end", "data": {"label": "End"}},
+    ]
+    loop_edges = [
+        {"id": "e1", "source": "s", "target": "i"},
+        {"id": "e2", "source": "i", "target": "d"},
+        {"id": "e3", "source": "d", "target": "p", "label": "Yes"},
+        {"id": "e4", "source": "d", "target": "o", "label": "No"},
+        {"id": "e5", "source": "p", "target": "d"},
+        {"id": "e6", "source": "o", "target": "e"},
+    ]
+    loop_code = logic_engine.compile_to_python(logic_engine.build_flowchart_ast(loop_nodes, loop_edges))
+    py_ast.parse(loop_code)
+    loop_output = executor.run_code_safely(loop_code, "1")
+    report("E loop emits backward edge as while", "while n < 3:" in loop_code and loop_output.rstrip().endswith("3"), repr(loop_output))
+
+    branch_nodes = [
+        {"id": "i", "type": "input_output", "data": {"label": "Input choice"}},
+        {"id": "d", "type": "decision", "data": {"label": "choice"}},
+        {"id": "a", "type": "input_output", "data": {"label": "Print Alpha"}},
+        {"id": "b", "type": "input_output", "data": {"label": "Print Beta"}},
+        {"id": "c", "type": "input_output", "data": {"label": "Print Gamma"}},
+    ]
+    branch_edges = [
+        {"id": "e1", "source": "i", "target": "d"},
+        {"id": "e2", "source": "d", "target": "a", "label": "A"},
+        {"id": "e3", "source": "d", "target": "b", "label": "B"},
+        {"id": "e4", "source": "d", "target": "c", "label": "C"},
+    ]
+    branch_code = logic_engine.compile_to_python(logic_engine.build_flowchart_ast(branch_nodes, branch_edges))
+    py_ast.parse(branch_code)
+    branch_output = executor.run_code_safely(branch_code, "C")
+    report("D three labeled branches are all compiled", branch_code.count("choice ==") == 3, branch_code.strip().replace("\n", " | "))
+    report("D third labeled branch executes", "Gamma" in branch_output, repr(branch_output))
+
+    try:
+        logic_engine.compile_to_python(logic_engine.build_flowchart_ast(
+            [
+                {"id": "d", "type": "decision", "data": {"label": "x >"}},
+                {"id": "a", "type": "output", "data": {"label": "Print A"}},
+                {"id": "b", "type": "output", "data": {"label": "Print B"}},
+            ],
+            [
+                {"source": "d", "target": "a", "label": "Yes"},
+                {"source": "d", "target": "b", "label": "No"},
+            ],
+        ))
+        condition_rejected = False
+    except ValueError:
+        condition_rejected = True
+    report("Invalid decision is rejected instead of guessed", condition_rejected)
 
     # 4. HTTP API Test if server is up
     try:
