@@ -435,7 +435,7 @@ async def generate_code(request_body: dict):
                 "Some imported connections have uncertain arrow direction. Review or reconnect the dashed edges before generating Python.",
             )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
-        code = llm_generator.generate_python_code(ast_data, GEMINI_API_KEY or None)
+        code = logic_engine.compile_to_python(ast_data)
 
         warnings = []
         try:

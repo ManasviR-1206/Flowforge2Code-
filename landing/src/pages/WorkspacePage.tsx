@@ -195,10 +195,13 @@ export const WorkspacePage: React.FC = () => {
   const outputEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch(apiUrl('/api/health')).then(r => r.json()).then(d => {
+    fetch(apiUrl('/api/health')).then(r => {
+      if (!r.ok) throw new Error(`Health check failed (${r.status})`);
+      return r.json();
+    }).then(d => {
       if (!d.ai_available) setAiBanner('AI generation is currently unavailable. Please configure the backend API key.');
     }).catch(() => {
-      setAiBanner('Cannot reach the FlowForge API. Start the FastAPI backend on port 8000.');
+      setAiBanner('Cannot reach the FlowForge API. Check the configured backend URL and make sure the backend is running.');
     });
   }, []);
 
@@ -407,7 +410,7 @@ export const WorkspacePage: React.FC = () => {
       if (!useSample && uploadFile) fd.append('file', uploadFile);
       const res = await fetch(apiUrl('/api/analyze'), { method: 'POST', body: fd }).catch((error: unknown) => {
         if (error instanceof TypeError) {
-          throw new Error('Cannot reach the FlowForge API. Start the FastAPI backend on port 8000 and retry.');
+          throw new Error('Cannot reach the FlowForge API. Check the configured backend URL and make sure the backend is running.');
         }
         throw error;
       });

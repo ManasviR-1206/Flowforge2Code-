@@ -25,16 +25,16 @@ Turn flowcharts into executable Python. The graph `{nodes, edges}` is the only s
 
    ```
    pip install -r requirements.txt
-   uvicorn api_server:app --host 0.0.0.0 --port 8000
+   uvicorn api_server:app --host 0.0.0.0 --port 8001
    ```
 
-   Open `http://localhost:8000/`. FastAPI serves the frontend and `/api/*` routes from this same host; `/` is the landing page and `/workspace` is the editor. Rebuild the frontend after changing it, then restart FastAPI.
+   Open `http://localhost:8001/`. FastAPI serves the frontend and `/api/*` routes from this same host; `/` is the landing page and `/workspace` is the editor. Rebuild the frontend after changing it, then restart FastAPI.
 
    Optional: install [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) so uploaded images get text labels.
 
 ## Frontend development (optional)
 
-For Vite hot reload, run the API on port 8000 and use a second terminal:
+For Vite hot reload, run the API on port 8001 and use a second terminal:
 
    ```powershell
    cd landing

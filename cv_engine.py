@@ -217,8 +217,8 @@ def filter_overlapping_blocks(blocks):
 
 def detect_connections(thresh_img, blocks):
     """
-    Detects line endpoints near nodes and infers arrow direction from arrowhead
-    pixel density. Connections without clear directional evidence are flagged.
+    Detects directed line segments and uses connected routes to recover loop-back
+    arrows that are split into multiple Hough segments.
     """
     connections = []
     warnings = []
@@ -230,7 +230,6 @@ def detect_connections(thresh_img, blocks):
     for block in blocks:
         x, y, w, h = block["bbox"]
         cv2.rectangle(mask, (max(0, x - 2), max(0, y - 2)), (x + w + 2, y + h + 2), 0, -1)
-
     lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=10)
     votes: dict[tuple[int, int], Counter] = defaultdict(Counter)
     vectors: dict[tuple[int, int], dict[tuple[int, int], tuple]] = defaultdict(dict)
@@ -269,7 +268,6 @@ def detect_connections(thresh_img, blocks):
             else:
                 source, target = first, second
                 vector = ((x1, y1), (x2, y2))
-            pair = tuple(sorted((int(source["id"]), int(target["id"]))))
             direction = (int(source["id"]), int(target["id"]))
             votes[pair][direction] += 1
             vectors[pair][direction] = vector
@@ -285,26 +283,103 @@ def detect_connections(thresh_img, blocks):
         for direction in directions:
             count = direction_votes[direction]
             confidence = count / total
-            uncertain = total < 2 or confidence < 0.67
+            if confidence < 0.67:
+                unresolved_pairs.add(pair)
+                continue
             connections.append({
                 "from": direction[0],
                 "to": direction[1],
                 "vector": vectors[pair][direction],
                 "branch": "",
                 "confidence": round(confidence, 2),
-                "uncertain": uncertain,
+                "uncertain": False,
             })
-            if uncertain:
-                warnings.append(
-                    f"Arrow direction between shapes {direction[0]} and {direction[1]} is uncertain; review this connection."
-                )
+
+    # A right-angle loop-back is often split into separate Hough segments.
+    # Recover it from a continuous connector component touching exactly two nodes.
+    route_mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+        (route_mask > 0).astype(np.uint8), 8
+    )
+    routed_pairs = set()
+    for component_id in range(1, component_count):
+        component_x, component_y, component_w, component_h, area = component_stats[component_id]
+        if area < 15:
+            continue
+        component = component_labels[
+            component_y:component_y + component_h,
+            component_x:component_x + component_w,
+        ] == component_id
+        local_ys, local_xs = np.where(component)
+        xs = local_xs + component_x
+        ys = local_ys + component_y
+
+        endpoints = []
+        for block in blocks:
+            x, y, w, h = block["bbox"]
+            dx = np.maximum(np.maximum(x - xs, 0), xs - (x + w))
+            dy = np.maximum(np.maximum(y - ys, 0), ys - (y + h))
+            distances = np.hypot(dx, dy)
+            index = int(np.argmin(distances))
+            distance = float(distances[index])
+            if distance <= 8:
+                endpoints.append((block, int(xs[index]), int(ys[index]), distance))
+
+        if len(endpoints) != 2:
+            continue
+
+        first, second = endpoints
+        pair = tuple(sorted((int(first[0]["id"]), int(second[0]["id"]))))
+        route_start = np.array([first[1], first[2]], dtype=np.float32)
+        route_end = np.array([second[1], second[2]], dtype=np.float32)
+        def route_ink(endpoint) -> int:
+            _, x, y, _ = endpoint
+            radius = 10
+            crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
+            return int(np.count_nonzero(crop))
+
+        first_ink = route_ink(first)
+        second_ink = route_ink(second)
+        if abs(first_ink - second_ink) < max(8, int(max(first_ink, second_ink) * 0.2)):
+            unresolved_pairs.add(pair)
+            continue
+
+        route_confidence = abs(first_ink - second_ink) / max(first_ink, second_ink)
+        if route_confidence < 0.2:
+            unresolved_pairs.add(pair)
+            continue
+
+        routed_pairs.add(pair)
+        if first_ink > second_ink:
+            source, target = second, first
+        else:
+            source, target = first, second
+        direction = (int(source[0]["id"]), int(target[0]["id"]))
+        if not any(
+            int(edge["from"]) == direction[0] and int(edge["to"]) == direction[1]
+            for edge in connections
+        ):
+            connections.append({
+                "from": direction[0],
+                "to": direction[1],
+                "vector": ((source[1], source[2]), (target[1], target[2])),
+                "branch": "",
+                "confidence": round(route_confidence, 2),
+                "uncertain": False,
+            })
+
+    unresolved_pairs.difference_update(routed_pairs)
 
     if not connections:
         warnings.append("No directed arrows could be reconstructed confidently. Connect the detected nodes manually.")
     detected_pairs = {tuple(sorted((int(edge["from"]), int(edge["to"])))) for edge in connections}
     for first_id, second_id in unresolved_pairs - detected_pairs:
         warnings.append(
-            f"A possible connection between shapes {first_id} and {second_id} has no clear arrow direction; review it manually."
+            f"A possible connection between shapes {first_id} and {second_id} has no clear arrow direction; it was omitted. Review it manually."
         )
     connected_ids = {
         int(node_id)
