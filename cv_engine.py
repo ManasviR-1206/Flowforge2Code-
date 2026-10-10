@@ -35,34 +35,41 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
     if num_vertices == 4:
         pts = approx.reshape(4, 2)
         angles = []
+        side_lengths = []
         for i in range(4):
             p1 = pts[i]
             p2 = pts[(i + 1) % 4]
             p3 = pts[(i + 2) % 4]
+            side_lengths.append(float(np.linalg.norm(p1 - p2)))
             v1 = p1 - p2
             v2 = p3 - p2
             cosine = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-5)
             angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
             angles.append(angle)
 
-        mean_angle = np.mean(angles)
-        # Trapezoid (manual input): top edge shorter / slanted
-        xs_top = sorted(pts, key=lambda p: p[1])[:2]
-        top_width = abs(float(xs_top[0][0] - xs_top[1][0]))
-        if top_width < 0.75 * w and 0.4 <= aspect_ratio <= 3.5 and mean_angle < 100:
+        by_y = sorted(pts, key=lambda p: p[1])
+        top, bottom = by_y[:2], by_y[2:]
+        top_level = abs(int(top[0][1]) - int(top[1][1])) <= 0.2 * h
+        bottom_level = abs(int(bottom[0][1]) - int(bottom[1][1])) <= 0.2 * h
+        top_width = abs(float(top[0][0] - top[1][0]))
+        bottom_width = abs(float(bottom[0][0] - bottom[1][0]))
+
+        if top_level and bottom_level and min(top_width, bottom_width) < 0.8 * max(top_width, bottom_width):
             return "manual_input"
 
-        if 82 <= mean_angle <= 98 and 0.2 <= aspect_ratio <= 5.0:
+        if max(abs(angle - 90) for angle in angles) <= 15 and 0.2 <= aspect_ratio <= 5.0:
             return "process"
-        elif 0.75 <= aspect_ratio <= 1.35 and circularity < 0.68:
+        side_ratio = max(side_lengths) / max(min(side_lengths), 1e-5)
+        if side_ratio <= 1.3 and circularity < 0.85:
             return "decision"
-        else:
-            return "input_output"
+        return "input_output"
 
     if num_vertices == 5:
         return "offpage"
 
     if num_vertices >= 6:
+        if num_vertices >= 7 and circularity > 0.58 and 2.0 <= aspect_ratio <= 3.5:
+            return "start_end"
         if circularity > 0.72 and 0.6 <= aspect_ratio <= 1.8:
             return "connector" if min(w, h) < 70 and circularity > 0.85 else "start_end"
         if circularity > 0.65:
@@ -129,27 +136,64 @@ def detect_symbols(img):
 
 def filter_overlapping_blocks(blocks):
     """
-    Removes inner contours nested inside larger blocks.
+    Removes duplicate contours while retaining individual symbols inside a
+    connected contour formed by arrows touching multiple flowchart shapes.
     """
     blocks = sorted(blocks, key=lambda b: b["area"], reverse=True)
+    aggregate_ids = set()
+
+    def contains(outer, inner):
+        x, y, w, h = outer["bbox"]
+        ix, iy, iw, ih = inner["bbox"]
+        return (
+            outer is not inner
+            and ix >= x and iy >= y
+            and ix + iw <= x + w and iy + ih <= y + h
+        )
+
+    def significantly_overlaps(outer, inner):
+        x, y, w, h = outer["bbox"]
+        ix, iy, iw, ih = inner["bbox"]
+        overlap_width = max(0, min(x + w, ix + iw) - max(x, ix))
+        overlap_height = max(0, min(y + h, iy + ih) - max(y, iy))
+        overlap_area = overlap_width * overlap_height
+        smaller_area = min(w * h, iw * ih)
+        return smaller_area > 0 and overlap_area >= smaller_area * 0.25
+
+    for block in blocks:
+        _, _, width, height = block["bbox"]
+        bbox_area = width * height
+        nested = [
+            candidate for candidate in blocks
+            if (contains(block, candidate) or significantly_overlaps(block, candidate))
+            and candidate["area"] < block["area"]
+            and candidate["bbox"][2] * candidate["bbox"][3] >= bbox_area * 0.02
+            and candidate["area"] >= block["area"] * 0.05
+        ]
+        distinct = []
+        for candidate in nested:
+            x, y, w, h = candidate["bbox"]
+            separated = all(
+                x + w <= ox or ox + ow <= x or y + h <= oy or oy + oh <= y
+                for ox, oy, ow, oh in (item["bbox"] for item in distinct)
+            )
+            if separated:
+                distinct.append(candidate)
+        if len(distinct) >= 2:
+            aggregate_ids.add(id(block))
+
     kept = []
-    
     for b in blocks:
-        x1, y1, w1, h1 = b["bbox"]
-        is_contained = False
-        for k in kept:
-            kx, ky, kw, kh = k["bbox"]
-            if x1 >= kx and y1 >= ky and (x1 + w1) <= (kx + kw) and (y1 + h1) <= (ky + kh):
-                is_contained = True
-                break
-        if not is_contained:
+        if id(b) in aggregate_ids:
+            continue
+        if not any(contains(k, b) for k in kept):
             kept.append(b)
-            
+
     # Re-assign clean sequential IDs sorted top-to-bottom
-    kept = sorted(kept, key=lambda b: b["bbox"][1])
+    kept = sorted(kept, key=lambda b: (b["bbox"][1], b["bbox"][0]))
     for i, b in enumerate(kept):
         b["id"] = i + 1
-        
+
     return kept
 
 def detect_connections(thresh_img, blocks):
@@ -169,17 +213,23 @@ def detect_connections(thresh_img, blocks):
     lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=10)
 
     if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
+        for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
             start_b = find_nearest_block((x1, y1), blocks)
             end_b = find_nearest_block((x2, y2), blocks)
 
             if start_b and end_b and start_b["id"] != end_b["id"]:
+                # Hough segments are undirected; flowcharts are laid out top-to-bottom.
+                if start_b["center"][1] > end_b["center"][1]:
+                    start_b, end_b = end_b, start_b
                 branch = ""
                 if start_b.get("type") == "decision":
-                    sx, sy = start_b["center"]
-                    mx = (x1 + x2) / 2
-                    branch = "Yes" if mx < sx else "No"
+                    sx = start_b["center"][0]
+                    tx, _ = end_b["center"]
+                    branch_offset = max(12, start_b["bbox"][2] * 0.2)
+                    if tx < sx - branch_offset:
+                        branch = "Yes"
+                    elif tx > sx + branch_offset:
+                        branch = "No"
                 connections.append({
                     "from": start_b["id"],
                     "to": end_b["id"],
@@ -203,8 +253,10 @@ def find_nearest_block(point, blocks, max_dist=120):
     min_d = float('inf')
     best = None
     for b in blocks:
-        bx, by = b["center"]
-        d = np.hypot(px - bx, py - by)
+        x, y, w, h = b["bbox"]
+        dx = max(x - px, 0, px - (x + w))
+        dy = max(y - py, 0, py - (y + h))
+        d = np.hypot(dx, dy)
         if d < min_d and d <= max_dist:
             min_d = d
             best = b

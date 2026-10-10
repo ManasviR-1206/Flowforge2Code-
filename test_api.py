@@ -177,10 +177,53 @@ def test_api():
     ok_enc, buf = cv2.imencode(".png", png)
     report("D sample PNG created", bool(ok_enc))
     st, data = post("/api/analyze", {"mode": "upload"}, files={"file": ("sample.png", buf.tobytes(), "image/png")})
-    report("D upload OpenCV to graph", st == 200 and len(data.get("nodes") or []) >= 1, f"status={st} nodes={len(data.get('nodes') or [])} {data.get('detail') or data.get('warning') or ''}")
+    imported_nodes = data.get("nodes") or []
+    imported_edges = data.get("edges") or []
+    imported_types = {node.get("type") for node in imported_nodes}
+    detected_graph = (
+        st == 200
+        and len(imported_nodes) >= 6
+        and {"start_end", "decision", "input_output"}.issubset(imported_types)
+        and {
+            (str(edge.get("source")), str(edge.get("target")), str(edge.get("label") or ""))
+            for edge in imported_edges
+        } == {
+            ("1", "2", ""),
+            ("2", "3", ""),
+            ("3", "4", "Yes"),
+            ("3", "5", "No"),
+            ("4", "6", ""),
+            ("5", "6", ""),
+        }
+    )
+    branch_labels = {str(edge.get("label", "")).lower() for edge in imported_edges}
+    report(
+        "D image upload detects even/odd graph symbols and branches",
+        detected_graph,
+        f"status={st} nodes={len(imported_nodes)} types={sorted(imported_types)} edges={len(imported_edges)} branches={sorted(branch_labels)} {data.get('warning') or ''}",
+    )
     if st == 200 and data.get("nodes"):
         stc, coded = post("/api/generate-code", {"nodes": data["nodes"], "edges": data.get("edges") or []})
-        report("D code from uploaded graph", stc == 200 and bool(coded.get("code")), (coded.get("code") or "")[:180])
+        labels_readable = all(
+            not str(node.get("data", {}).get("label", "")).lower().startswith("unlabeled")
+            for node in data["nodes"]
+        )
+        report(
+            "D uploaded graph code is valid or explicitly requests label edits",
+            (stc == 200 and bool(coded.get("code"))) or (not labels_readable and stc == 422 and "edit" in str(coded.get("detail", "")).lower()),
+            (coded.get("code") or coded.get("detail") or "")[:180],
+        )
+
+    bad_status, bad_image = post(
+        "/api/analyze",
+        {"mode": "upload"},
+        files={"file": ("invalid.png", b"not-an-image" * 16, "image/png")},
+    )
+    report(
+        "E invalid image returns a useful error",
+        bad_status == 400 and "image" in str(bad_image.get("detail", "")).lower(),
+        f"status={bad_status} {bad_image.get('detail') or ''}",
+    )
 
     st, data = post("/api/debug", {
         "nodes": [

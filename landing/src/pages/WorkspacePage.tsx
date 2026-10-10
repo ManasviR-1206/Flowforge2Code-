@@ -125,6 +125,7 @@ export const WorkspacePage: React.FC = () => {
   const [loadingChat, setLoadingChat] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
   const [loadingUpload, setLoadingUpload] = useState(false);
   const [uploadOverlay, setUploadOverlay] = useState<string | null>(null);
@@ -591,6 +592,13 @@ export const WorkspacePage: React.FC = () => {
 
   return (
     <div className="h-[100dvh] flex flex-col font-sans antialiased overflow-hidden" style={{ background: '#030817', color: '#fff' }}>
+      <input
+        ref={uploadInputRef}
+        type="file"
+        accept=".png,.jpg,.jpeg,image/png,image/jpeg"
+        onChange={e => handleFileChange(e.target.files?.[0] || null)}
+        className="hidden"
+      />
       <header className="h-14 flex items-center justify-between px-3 sm:px-6 border-b border-white/10 bg-slate-950/80 backdrop-blur-md sticky top-0 z-50 shrink-0">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-violet-600 flex items-center justify-center shadow-[0_0_14px_rgba(6,182,212,0.5)]">
@@ -691,7 +699,10 @@ export const WorkspacePage: React.FC = () => {
           <div className="flex items-center gap-1 px-2 py-2 border-b border-white/10 bg-slate-950/40 shrink-0 flex-wrap">
             <div className="flex items-center gap-1 rounded-lg bg-slate-900 p-0.5 border border-slate-800 mr-1">
               {([['draw', 'Draw'], ['upload', 'Upload'], ['ai', 'AI Generate']] as const).map(([m, lab]) => (
-                <button key={m} onClick={() => setMode(m)}
+                <button key={m} onClick={() => {
+                  setMode(m);
+                  if (m === 'upload') uploadInputRef.current?.click();
+                }}
                   className={`px-2.5 py-1.5 rounded-md text-[11px] font-bold ${mode === m ? 'bg-cyan-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]' : 'text-slate-400 hover:text-white'}`}>{lab}</button>
               ))}
             </div>
@@ -719,10 +730,9 @@ export const WorkspacePage: React.FC = () => {
                 <p className="text-xs text-slate-400">PNG/JPG is sent to FastAPI → OpenCV shape detection → OCR → editable graph on the canvas. The image itself is not the flowchart.</p>
                 <div className="border-2 border-dashed border-slate-700 hover:border-cyan-500/50 rounded-xl p-6 flex flex-col items-center gap-3">
                   {uploadPreview ? <img src={uploadPreview} alt="Preview" className="max-h-48 rounded-lg object-contain" /> : <div className="text-slate-500 text-sm">Drop or choose an image</div>}
-                  <label className="cursor-pointer px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded-lg">
+                  <button type="button" onClick={() => uploadInputRef.current?.click()} className="cursor-pointer px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded-lg">
                     Select Flowchart Image
-                    <input type="file" accept="image/png,image/jpg,image/jpeg" onChange={e => handleFileChange(e.target.files?.[0] || null)} className="hidden" />
-                  </label>
+                  </button>
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => handleAnalyzeImage(false)} disabled={!uploadFile || loadingUpload} className="flex-1 py-2.5 bg-slate-800 border border-cyan-500/40 text-cyan-300 text-xs font-bold rounded-lg disabled:opacity-40">

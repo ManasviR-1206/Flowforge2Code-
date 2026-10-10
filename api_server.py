@@ -72,25 +72,34 @@ def get_gemini_model(model_name: str = "gemini-3.8-flash"):
 
 
 def generate_sample_flowchart_cv() -> np.ndarray:
-    canvas = np.ones((500, 400, 3), dtype=np.uint8) * 255
-    cv2.ellipse(canvas, (200, 50), (60, 25), 0, 0, 360, (0, 180, 0), 2)
-    cv2.putText(canvas, "Start", (180, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 0), 2)
-    cv2.arrowedLine(canvas, (200, 75), (200, 120), (0, 0, 0), 2, tipLength=0.2)
-    pts = np.array([[130, 120], [270, 120], [240, 160], [100, 160]], np.int32)
-    cv2.polylines(canvas, [pts], True, (255, 0, 255), 2)
-    cv2.putText(canvas, "Input n", (150, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-    cv2.arrowedLine(canvas, (200, 160), (200, 210), (0, 0, 0), 2, tipLength=0.2)
-    d_pts = np.array([[200, 210], [270, 250], [200, 290], [130, 250]], np.int32)
-    cv2.polylines(canvas, [d_pts], True, (0, 200, 200), 2)
-    cv2.putText(canvas, "n > 0?", (175, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 150), 2)
-    cv2.arrowedLine(canvas, (200, 290), (200, 340), (0, 0, 0), 2, tipLength=0.2)
-    cv2.putText(canvas, "Yes", (210, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-    o_pts = np.array([[130, 340], [270, 340], [240, 380], [100, 380]], np.int32)
-    cv2.polylines(canvas, [o_pts], True, (255, 0, 255), 2)
-    cv2.putText(canvas, "Print Positive", (135, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 2)
-    cv2.arrowedLine(canvas, (200, 380), (200, 430), (0, 0, 0), 2, tipLength=0.2)
-    cv2.ellipse(canvas, (200, 455), (60, 25), 0, 0, 360, (0, 0, 255), 2)
-    cv2.putText(canvas, "End", (185, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    canvas = np.ones((620, 700, 3), dtype=np.uint8) * 255
+    cv2.ellipse(canvas, (350, 45), (72, 26), 0, 0, 360, (0, 0, 0), 2)
+    cv2.putText(canvas, "Start", (325, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    input_pts = np.array([[290, 105], [430, 105], [408, 160], [268, 160]], np.int32)
+    cv2.polylines(canvas, [input_pts], True, (0, 0, 0), 2)
+    cv2.putText(canvas, "Input n", (320, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+    cv2.arrowedLine(canvas, (350, 72), (350, 102), (0, 0, 0), 2, tipLength=0.25)
+
+    decision_pts = np.array([[350, 200], [430, 255], [350, 310], [270, 255]], np.int32)
+    cv2.polylines(canvas, [decision_pts], True, (0, 0, 0), 2)
+    cv2.putText(canvas, "n % 2 == 0?", (300, 261), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2)
+    cv2.arrowedLine(canvas, (350, 160), (350, 198), (0, 0, 0), 2, tipLength=0.25)
+
+    left_pts = np.array([[75, 365], [250, 365], [230, 415], [55, 415]], np.int32)
+    right_pts = np.array([[450, 365], [625, 365], [605, 415], [430, 415]], np.int32)
+    cv2.polylines(canvas, [left_pts, right_pts], True, (0, 0, 0), 2)
+    cv2.putText(canvas, 'Print "Even"', (95, 398), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    cv2.putText(canvas, 'Print "Odd"', (475, 398), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    cv2.putText(canvas, "Yes", (230, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    cv2.putText(canvas, "No", (455, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    cv2.arrowedLine(canvas, (270, 255), (155, 362), (0, 0, 0), 2, tipLength=0.15)
+    cv2.arrowedLine(canvas, (430, 255), (535, 362), (0, 0, 0), 2, tipLength=0.15)
+
+    cv2.ellipse(canvas, (350, 555), (72, 26), 0, 0, 360, (0, 0, 0), 2)
+    cv2.putText(canvas, "End", (335, 561), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    cv2.arrowedLine(canvas, (155, 415), (350, 526), (0, 0, 0), 2, tipLength=0.15)
+    cv2.arrowedLine(canvas, (535, 415), (350, 526), (0, 0, 0), 2, tipLength=0.15)
     return canvas
 
 
@@ -112,12 +121,24 @@ NODE_TYPE_MAP = {
 
 def blocks_to_react_nodes(blocks, img_height=500, img_width=400) -> list:
     nodes = []
+    placeholder_labels = {
+        "start_end": "Start / End",
+        "input_output": "Unlabeled input/output",
+        "decision": "Unlabeled decision",
+        "process": "Unlabeled process",
+        "manual_input": "Unlabeled input",
+    }
     for i, b in enumerate(blocks):
         shape_type = b.get("type", "process")
-        text = b.get("text", "").strip() or f"Step {b['id']}"
+        text = b.get("text", "").strip()
         bbox = b.get("bbox", (0, 0, 50, 50))
         cx = b.get("center", (img_width // 2, (i + 1) * 100))[0]
         cy = b.get("center", (img_width // 2, (i + 1) * 100))[1]
+        if not text:
+            if shape_type == "start_end":
+                text = "Start" if cy <= img_height / 2 else "End"
+            else:
+                text = placeholder_labels.get(shape_type, "Unlabeled flowchart step")
         x = int((cx / max(img_width, 1)) * 550) + 50
         y = int((cy / max(img_height, 1)) * 600) + 30
         nodes.append({
@@ -241,6 +262,8 @@ async def analyze(
         for b in blocks:
             try:
                 b["text"] = ocr_engine.extract_block_text(norm_img, b["bbox"])
+                if not b["text"]:
+                    ocr_failed += 1
             except Exception:
                 b["text"] = ""
                 ocr_failed += 1
@@ -259,8 +282,11 @@ async def analyze(
         connections_json = [{"from": c["from"], "to": c["to"], "branch": c.get("branch", "")} for c in connections]
 
         warning = None
-        if ocr_failed == len(blocks):
-            warning = "OCR failed to read text from the image. Shapes were detected — please edit node labels on the canvas."
+        if ocr_failed:
+            warning = (
+                f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes. "
+                "Please review and edit those node labels on the canvas."
+            )
 
         return JSONResponse({
             "nodes": react_nodes,
@@ -331,6 +357,17 @@ async def generate_code(request_body: dict):
             raise HTTPException(400, "Canvas is empty. Please create a flowchart first.")
 
         nodes, edges = logic_engine.sanitize_graph(nodes, edges)
+        unlabeled = [
+            logic_engine.node_text(node)
+            for node in nodes
+            if not logic_engine.node_text(node)
+            or logic_engine.node_text(node).lower().startswith("unlabeled")
+        ]
+        if unlabeled:
+            raise HTTPException(
+                422,
+                "Some imported flowchart labels could not be read. Edit the highlighted or unlabeled nodes, then generate Python again.",
+            )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
         code = llm_generator.generate_python_code(ast_data, GEMINI_API_KEY or None)
 
@@ -340,6 +377,14 @@ async def generate_code(request_body: dict):
         except SyntaxError:
             code = logic_engine.compile_to_python(ast_data)
             warnings.append("LLM code had syntax errors; using the flowchart compiler instead.")
+
+        try:
+            py_ast.parse(code)
+        except SyntaxError as se:
+            raise HTTPException(
+                422,
+                f"The current flowchart could not be translated to valid Python: {se.msg} (line {se.lineno}).",
+            )
 
         warnings.extend(logic_engine.consistency_warnings(ast_data, code))
         return JSONResponse({"code": code, "ast": ast_data, "warnings": warnings})

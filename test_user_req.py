@@ -120,6 +120,15 @@ def run_tests():
             st_exec, res_exec = post("/api/execute", {"code": c, "user_input": "5\n10\n+"})
             print("HTTP API Output for '5\\n10\\n+':", repr(res_exec.get("output")))
             assert "15" in str(res_exec.get("output"))
+        st, res_code = post("/api/generate-code", EVEN_ODD_GRAPH)
+        assert st == 200, res_code
+        even_odd_code = res_code.get("code", "")
+        py_ast.parse(even_odd_code)
+        for value, expected in (("10", "Even"), ("7", "Odd")):
+            st_exec, res_exec = post("/api/execute", {"code": even_odd_code, "user_input": value})
+            actual = str(res_exec.get("program_output") or res_exec.get("output") or "")
+            assert st_exec == 200 and expected in actual, (value, expected, res_exec)
+            print(f"HTTP API Input {value} -> {actual.strip()}")
     except Exception as ex:
         print("API test note:", ex)
 
