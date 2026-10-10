@@ -1,5 +1,11 @@
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+
+export function apiUrl(path: string) {
+  return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 export async function apiJson(path: string, options?: RequestInit) {
-  const res = await fetch(path, options);
+  const res = await fetch(apiUrl(path), options);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const detail = (data as any)?.detail;

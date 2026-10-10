@@ -1,32 +1,60 @@
 import os
 import re
 import shutil
+import subprocess
 import cv2
 import pytesseract
-from PIL import Image
 
-# Locate Tesseract on Windows automatically if standard installation exists
-COMMON_TESSERACT_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
-]
+WINDOWS_TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_tesseract_available = False
 
 def init_tesseract():
-    for p in COMMON_TESSERACT_PATHS:
-        if os.path.exists(p):
-            pytesseract.pytesseract.tesseract_cmd = p
-            return True
+    global _tesseract_available
+    configured_path = os.getenv("TESSERACT_CMD", "").strip().strip('"')
+    candidates = [os.path.expandvars(os.path.expanduser(configured_path))] if configured_path else []
+    if os.name == "nt":
+        candidates.append(WINDOWS_TESSERACT_PATH)
+    else:
+        candidates.append("tesseract")
+
+    for candidate in candidates:
+        executable = shutil.which(candidate) or candidate
+        if not os.path.isfile(executable):
+            continue
+        pytesseract.pytesseract.tesseract_cmd = executable
+        try:
+            pytesseract.get_tesseract_version()
+        except (OSError, subprocess.SubprocessError, pytesseract.TesseractNotFoundError, pytesseract.TesseractError):
+            continue
+        _tesseract_available = True
+        return True
+
+    _tesseract_available = False
     return False
 
 
 def tesseract_available():
-    command = pytesseract.pytesseract.tesseract_cmd
-    return os.path.isfile(command) or shutil.which(command) is not None
+    return _tesseract_available
 
 
-# Initialize on import
-init_tesseract()
+def _read_candidate(image):
+    data = pytesseract.image_to_data(
+        image,
+        config="--oem 3 --psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+    words = [
+        (text.strip(), float(confidence))
+        for text, confidence in zip(data["text"], data["conf"])
+        if text.strip()
+    ]
+    confident_words = [(text, confidence) for text, confidence in words if confidence >= 60]
+    selected_words = confident_words or words
+    if not selected_words:
+        return "", -1
+    text = " ".join(word for word, _ in selected_words)
+    confidence = sum(score for _, score in selected_words) / len(selected_words)
+    return text, confidence
 
 def extract_block_text(img, bbox):
     """
@@ -44,34 +72,44 @@ def extract_block_text(img, bbox):
     if roi.size == 0:
         return ""
 
-    return extract_region_text(img, (x1, y1, x2 - x1, y2 - y1))
+    if not tesseract_available():
+        return ""
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    candidates = []
+    full_size = cv2.resize(gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    candidates.append(_read_candidate(full_size))
+
+    height, width = gray.shape[:2]
+    inner = gray[int(height * 0.2):int(height * 0.8), int(width * 0.16):int(width * 0.84)]
+    if inner.size:
+        inner_size = cv2.resize(inner, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        candidates.append(_read_candidate(inner_size))
+
+    text, _ = max(candidates, key=lambda candidate: candidate[1])
+    return clean_ocr_text(text)
 
 
 def extract_region_text(img, bbox):
     """Read text from an arbitrary image region, including connector labels."""
+    text, _ = extract_region_text_with_confidence(img, bbox)
+    return text
+
+
+def extract_region_text_with_confidence(img, bbox):
+    """Return OCR text and its mean word confidence for comparing candidate crops."""
     x, y, w, h = bbox
     img_h, img_w = img.shape[:2]
     x1, y1 = max(0, int(x)), max(0, int(y))
     x2, y2 = min(img_w, int(x + w)), min(img_h, int(y + h))
     roi = img[y1:y2, x1:x2]
     if roi.size == 0 or not tesseract_available():
-        return ""
+        return "", -1
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    filtered = cv2.bilateralFilter(scaled, 7, 50, 50)
-    _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    raw_text = ""
-    try:
-        for psm in ("7", "6", "11", "8"):
-            raw_text = pytesseract.image_to_string(thresh, config=f"--psm {psm}")
-            if raw_text.strip():
-                break
-    except Exception:
-        raw_text = ""
-
-    return clean_ocr_text(raw_text)
+    scaled = cv2.resize(gray, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    text, confidence = _read_candidate(scaled)
+    return clean_ocr_text(text), confidence
 
 def clean_ocr_text(raw_text):
     """
@@ -87,3 +125,6 @@ def clean_ocr_text(raw_text):
     cleaned = re.sub(r'\b[eE][nN][dD]\b', 'End', cleaned)
     
     return cleaned
+
+
+init_tesseract()

@@ -21,14 +21,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
 import cv_engine
 import ocr_engine
 import logic_engine
 import llm_generator
 import executor
-
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 app = FastAPI(title="FlowForge AI API", version="3.0.0")
 
@@ -287,13 +288,19 @@ async def analyze(
                     continue
                 sx, sy = start_block["center"]
                 tx, ty = end_block["center"]
+                branch_candidates = []
                 for fraction in (0.3, 0.5, 0.7):
                     x = int(sx + (tx - sx) * fraction)
                     y = int(sy + (ty - sy) * fraction)
-                    label = ocr_engine.extract_region_text(norm_img, (x - 36, y - 22, 72, 44))
+                    label, confidence = ocr_engine.extract_region_text_with_confidence(
+                        norm_img, (x - 36, y - 22, 72, 44)
+                    )
                     if label:
+                        branch_candidates.append((label, confidence))
+                if branch_candidates:
+                    label, confidence = max(branch_candidates, key=lambda candidate: candidate[1])
+                    if confidence >= 60:
                         connection["branch"] = label
-                        break
 
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
         overlay_b64 = img_to_b64(overlay)

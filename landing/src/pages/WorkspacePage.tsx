@@ -15,7 +15,7 @@ import 'reactflow/dist/style.css';
 import { toPng } from 'html-to-image';
 import { nodeTypes } from '../flowchart/FlowNodes';
 import { SYMBOLS } from '../flowchart/symbols';
-import { apiJson, graphPayload } from '../flowchart/api';
+import { apiJson, apiUrl, graphPayload } from '../flowchart/api';
 
 const edgeLook = (label?: string) => {
   const color = label === 'Yes' ? '#34d399' : label === 'No' ? '#f87171' : '#94a3b8';
@@ -195,7 +195,7 @@ export const WorkspacePage: React.FC = () => {
   const outputEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch('/api/health').then(r => r.json()).then(d => {
+    fetch(apiUrl('/api/health')).then(r => r.json()).then(d => {
       if (!d.ai_available) setAiBanner('AI generation is currently unavailable. Please configure the backend API key.');
     }).catch(() => {
       setAiBanner('Cannot reach the FlowForge API. Start the FastAPI backend on port 8000.');
@@ -405,9 +405,22 @@ export const WorkspacePage: React.FC = () => {
       const fd = new FormData();
       fd.append('mode', useSample ? 'sample' : 'upload');
       if (!useSample && uploadFile) fd.append('file', uploadFile);
-      const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+      const res = await fetch(apiUrl('/api/analyze'), { method: 'POST', body: fd }).catch((error: unknown) => {
+        if (error instanceof TypeError) {
+          throw new Error('Cannot reach the FlowForge API. Start the FastAPI backend on port 8000 and retry.');
+        }
+        throw error;
+      });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Analysis failed');
+      if (!res.ok) {
+        const detail = data.detail;
+        const message = typeof detail === 'string'
+          ? detail
+          : Array.isArray(detail)
+            ? detail.map((item: any) => item.msg || item).join(' ')
+            : `Image analysis failed (${res.status}).`;
+        throw new Error(message);
+      }
       setUploadOverlay(data.overlay_image || null);
       if (data.nodes?.length) {
         loadFlowchart(data.nodes, data.edges || []);
