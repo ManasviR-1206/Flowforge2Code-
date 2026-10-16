@@ -86,31 +86,74 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
 
     return "unknown"
 
+def get_adaptive_params(h: int, w: int) -> dict:
+    """
+    Computes adaptive image-processing kernels and thresholds scaled
+    proportionally to image dimensions, replacing brittle fixed constants.
+    """
+    dim = max(h, w)
+    scale = max(0.5, min(3.5, dim / 800.0))
+    k_blur = max(3, int(round(5 * scale))) | 1
+    k_thresh_block = max(7, int(round(11 * scale))) | 1
+    k_morph = max(3, int(round(3 * scale))) | 1
+
+    pad = max(3, int(round(5 * scale)))
+    hough_thresh = max(15, int(round(20 * scale)))
+    min_line_len = max(10, int(round(15 * scale)))
+    max_line_gap = max(5, int(round(10 * scale)))
+
+    endpoint_radius = max(6, int(round(9 * scale)))
+    ink_diff_thresh = max(3, int(round(5 * scale)))
+    block_near_dist = max(25, int(round(35 * scale)))
+    route_dist = max(14, int(round(20 * scale)))
+    min_component_area = max(15, int(round(30 * (scale ** 2))))
+
+    return {
+        "scale": scale,
+        "k_blur": (k_blur, k_blur),
+        "k_thresh_block": k_thresh_block,
+        "k_morph": (k_morph, k_morph),
+        "pad": pad,
+        "hough_thresh": hough_thresh,
+        "min_line_len": min_line_len,
+        "max_line_gap": max_line_gap,
+        "endpoint_radius": endpoint_radius,
+        "ink_diff_thresh": ink_diff_thresh,
+        "block_near_dist": block_near_dist,
+        "route_dist": route_dist,
+        "min_component_area": min_component_area,
+    }
+
+
 def detect_symbols(img):
     """
-    Detects symbols from a preprocessed image array.
+    Detects symbols from a preprocessed image array using adaptive
+    thresholding and dimension-scaled morphological operations.
     Returns detected blocks list and thresholded binary image.
     """
+    h, w = img.shape[:2]
+    params = get_adaptive_params(h, w)
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Otsu adaptive thresholding
+    blurred = cv2.GaussianBlur(gray, params["k_blur"], 0)
+
+    # Adaptive Gaussian thresholding with dimension-scaled block size
     thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY_INV, 11, 2
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, params["k_thresh_block"], 2
     )
 
-    # Morphological closing
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # Morphological closing with adaptive kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, params["k_morph"])
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
     contours, hierarchy = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     blocks = []
     block_id = 1
-    
-    img_area = img.shape[0] * img.shape[1]
-    min_area = max(600, img_area * 0.001)
+
+    img_area = h * w
+    min_area = max(400 * (params["scale"] ** 2), img_area * 0.0008)
     max_area = img_area * 0.85
 
     for cnt in contours:
@@ -120,8 +163,8 @@ def detect_symbols(img):
 
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect_ratio = float(w) / max(1, h)
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect_ratio = float(bw) / max(1, bh)
         circularity = (4 * np.pi * area) / (peri * peri) if peri > 0 else 0
 
         shape_type = classify_shape(approx, cnt, aspect_ratio, circularity)
@@ -130,8 +173,8 @@ def detect_symbols(img):
             blocks.append({
                 "id": block_id,
                 "type": shape_type,
-                "bbox": (x, y, w, h),
-                "center": (x + w // 2, y + h // 2),
+                "bbox": (x, y, bw, bh),
+                "center": (x + bw // 2, y + bh // 2),
                 "area": area
             })
             block_id += 1
@@ -139,6 +182,7 @@ def detect_symbols(img):
     # Filter nested duplicate bounding boxes
     filtered_blocks = filter_overlapping_blocks(blocks)
     return filtered_blocks, thresh
+
 
 def filter_overlapping_blocks(blocks):
     """
@@ -226,29 +270,38 @@ def is_duplicate_reverse(v1, v2):
 def detect_connections(thresh_img, blocks):
     """
     Detects directed line segments and uses connected routes to recover loop-back
-    arrows that are split into multiple Hough segments.
+    arrows and complex routes, adapting all morphology and thresholds to image size.
+    Exposes arrow uncertainty and avoids silently discarding ambiguous connections.
     """
     connections = []
     warnings = []
     if len(blocks) < 2:
         return connections, warnings
 
-    # Pad 5 clears symbol boundaries (including thick strokes, curved oval arcs,
-    # and diamond corners) so shapes don't bridge into connectors or skew ink scoring.
+    h, w = thresh_img.shape[:2]
+    params = get_adaptive_params(h, w)
+
+    # Adaptive padding clears symbol boundaries so shapes don't bridge into connectors
     mask = thresh_img.copy()
+    pad = params["pad"]
     for block in blocks:
-        x, y, w, h = block["bbox"]
-        pad = 5
-        cv2.rectangle(mask, (max(0, x - pad), max(0, y - pad)), (x + w + pad, y + h + pad), 0, -1)
-    lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=10)
+        bx, by, bw, bh = block["bbox"]
+        cv2.rectangle(mask, (max(0, bx - pad), max(0, by - pad)), (min(w, bx + bw + pad), min(h, by + bh + pad)), 0, -1)
+
+    lines = cv2.HoughLinesP(
+        mask, 1, np.pi / 180,
+        threshold=params["hough_thresh"],
+        minLineLength=params["min_line_len"],
+        maxLineGap=params["max_line_gap"]
+    )
     votes: dict[tuple[int, int], Counter] = defaultdict(Counter)
     vectors: dict[tuple[int, int], dict[tuple[int, int], tuple]] = defaultdict(dict)
     unresolved_pairs = set()
     seen_segments = set()
 
-    def endpoint_ink(x: int, y: int) -> int:
-        radius = 8
-        crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
+    def endpoint_ink(px: int, py: int) -> int:
+        radius = params["endpoint_radius"]
+        crop = mask[max(0, py - radius):min(h, py + radius + 1), max(0, px - radius):min(w, px + radius + 1)]
         return int(np.count_nonzero(crop))
 
     if lines is not None:
@@ -259,8 +312,8 @@ def detect_connections(thresh_img, blocks):
                 continue
             seen_segments.add(segment)
 
-            first = find_nearest_block((x1, y1), blocks, max_dist=35)
-            second = find_nearest_block((x2, y2), blocks, max_dist=35)
+            first = find_nearest_block((x1, y1), blocks, max_dist=params["block_near_dist"])
+            second = find_nearest_block((x2, y2), blocks, max_dist=params["block_near_dist"])
             if not first or not second or first["id"] == second["id"]:
                 continue
 
@@ -268,40 +321,51 @@ def detect_connections(thresh_img, blocks):
             second_ink = endpoint_ink(x2, y2)
             pair = tuple(sorted((int(first["id"]), int(second["id"]))))
 
-            if abs(first_ink - second_ink) >= 6:
+            diff = abs(first_ink - second_ink)
+            if diff >= params["ink_diff_thresh"]:
                 if first_ink > second_ink:
                     source, target = second, first
                     vector = ((x2, y2), (x1, y1))
                 else:
                     source, target = first, second
                     vector = ((x1, y1), (x2, y2))
+                direction = (int(source["id"]), int(target["id"]))
+                votes[pair][direction] += 1
+                vectors[pair][direction] = vector
             else:
-                # Top-to-bottom flowchart convention fallback when ink is balanced
+                # Balanced ink — don't invent direction without checking terminals
                 f_type, s_type = first.get("type"), second.get("type")
                 if f_type == "start_end" and first["center"][1] < second["center"][1]:
                     source, target = first, second
+                    vector = ((x1, y1), (x2, y2))
+                    votes[pair][(int(source["id"]), int(target["id"]))] += 1
+                    vectors[pair][(int(source["id"]), int(target["id"]))] = vector
                 elif s_type == "start_end" and second["center"][1] < first["center"][1]:
                     source, target = second, first
+                    vector = ((x2, y2), (x1, y1))
+                    votes[pair][(int(source["id"]), int(target["id"]))] += 1
+                    vectors[pair][(int(source["id"]), int(target["id"]))] = vector
                 elif f_type == "start_end" and first["center"][1] > second["center"][1]:
                     source, target = second, first
+                    vector = ((x2, y2), (x1, y1))
+                    votes[pair][(int(source["id"]), int(target["id"]))] += 1
+                    vectors[pair][(int(source["id"]), int(target["id"]))] = vector
                 elif s_type == "start_end" and second["center"][1] > first["center"][1]:
                     source, target = first, second
-                elif first["center"][1] <= second["center"][1]:
-                    source, target = first, second
+                    vector = ((x1, y1), (x2, y2))
+                    votes[pair][(int(source["id"]), int(target["id"]))] += 1
+                    vectors[pair][(int(source["id"]), int(target["id"]))] = vector
                 else:
-                    source, target = second, first
-                vector = ((x1, y1), (x2, y2)) if source["id"] == first["id"] else ((x2, y2), (x1, y1))
-
-            direction = (int(source["id"]), int(target["id"]))
-            votes[pair][direction] += 1
-            vectors[pair][direction] = vector
+                    # Ambiguous direction
+                    unresolved_pairs.add(pair)
 
     for pair, direction_votes in votes.items():
         total = sum(direction_votes.values())
         ranked = direction_votes.most_common()
         best_dir, best_count = ranked[0]
         confidence = best_count / total
-        if confidence < 0.5:
+        is_uncertain = (confidence < 0.6)
+        if confidence < 0.4:
             unresolved_pairs.add(pair)
             continue
         connections.append({
@@ -310,14 +374,14 @@ def detect_connections(thresh_img, blocks):
             "vector": vectors[pair][best_dir],
             "branch": "",
             "confidence": round(confidence, 2),
-            "uncertain": False,
+            "uncertain": is_uncertain,
         })
 
     # Connected component route recovery for multi-segment, loop-back, and merging routes
     route_mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, params["k_morph"]),
     )
     component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
         (route_mask > 0).astype(np.uint8), 8
@@ -325,7 +389,7 @@ def detect_connections(thresh_img, blocks):
     routed_pairs = set()
     for component_id in range(1, component_count):
         component_x, component_y, component_w, component_h, area = component_stats[component_id]
-        if area < 30:
+        if area < params["min_component_area"]:
             continue
         component = component_labels[
             component_y:component_y + component_h,
@@ -337,17 +401,15 @@ def detect_connections(thresh_img, blocks):
 
         endpoints = []
         for block in blocks:
-            x, y, w, h = block["bbox"]
-            dx = np.maximum(np.maximum(x - xs, 0), xs - (x + w))
-            dy = np.maximum(np.maximum(y - ys, 0), ys - (y + h))
+            bx, by, bw, bh = block["bbox"]
+            dx = np.maximum(np.maximum(bx - xs, 0), xs - (bx + bw))
+            dy = np.maximum(np.maximum(by - ys, 0), ys - (by + bh))
             distances = np.hypot(dx, dy)
             index = int(np.argmin(distances))
             distance = float(distances[index])
-            if distance <= 15:
+            if distance <= params["route_dist"]:
                 ex, ey = int(xs[index]), int(ys[index])
-                radius = 10
-                crop = mask[max(0, ey - radius):ey + radius + 1, max(0, ex - radius):ex + radius + 1]
-                ink = int(np.count_nonzero(crop))
+                ink = endpoint_ink(ex, ey)
                 endpoints.append({
                     "block": block,
                     "point": (ex, ey),
@@ -366,11 +428,17 @@ def detect_connections(thresh_img, blocks):
             source_ep = endpoints[1]
             t_block = target_ep["block"]
             s_block = source_ep["block"]
+
+            # Terminals cannot be the target of a top start node
             if t_block.get("type") == "start_end" and t_block["center"][1] < s_block["center"][1]:
                 target_ep, source_ep = source_ep, target_ep
+                t_block, s_block = target_ep["block"], source_ep["block"]
 
             diff = target_ep["ink"] - source_ep["ink"]
-            conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2)))
+            is_backward = s_block["center"][1] > t_block["center"][1]
+            is_uncertain = (diff < params["ink_diff_thresh"] and not is_backward)
+
+            conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2))) if diff > 0 else 0.5
             dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
             pair = tuple(sorted(dir_pair))
             routed_pairs.add(pair)
@@ -381,7 +449,7 @@ def detect_connections(thresh_img, blocks):
                 "vector": (source_ep["point"], target_ep["point"]),
                 "branch": "",
                 "confidence": conf,
-                "uncertain": False,
+                "uncertain": is_uncertain,
             })
         else:
             # Multi-endpoint (merging branches or loopback T-junctions)
@@ -390,34 +458,53 @@ def detect_connections(thresh_img, blocks):
                 dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
                 pair = tuple(sorted(dir_pair))
                 routed_pairs.add(pair)
+                diff = target_ep["ink"] - source_ep["ink"]
                 connections.append({
                     "from": dir_pair[0],
                     "to": dir_pair[1],
                     "vector": (source_ep["point"], target_ep["point"]),
                     "branch": "",
-                    "confidence": 0.8,
-                    "uncertain": False,
+                    "confidence": 0.8 if diff >= params["ink_diff_thresh"] else 0.5,
+                    "uncertain": diff < params["ink_diff_thresh"],
                 })
 
     unresolved_pairs.difference_update(routed_pairs)
+
+    # For unresolved pairs with physical paths, preserve uncertainty instead of silently dropping
+    detected_pairs = {tuple(sorted((int(edge["from"]), int(edge["to"])))) for edge in connections}
+    for first_id, second_id in unresolved_pairs - detected_pairs:
+        b1 = next((b for b in blocks if int(b["id"]) == first_id), None)
+        b2 = next((b for b in blocks if int(b["id"]) == second_id), None)
+        if b1 and b2:
+            # Add as uncertain connection rather than silently discarding
+            connections.append({
+                "from": first_id,
+                "to": second_id,
+                "vector": (b1["center"], b2["center"]),
+                "branch": "",
+                "confidence": 0.3,
+                "uncertain": True,
+            })
+            warnings.append(
+                f"A connection between shapes {first_id} and {second_id} has ambiguous arrow direction; marked uncertain."
+            )
 
     connections = deduplicate_connections(connections)
 
     if not connections:
         warnings.append("No directed arrows could be reconstructed confidently. Connect the detected nodes manually.")
-    detected_pairs = {tuple(sorted((int(edge["from"]), int(edge["to"])))) for edge in connections}
-    for first_id, second_id in unresolved_pairs - detected_pairs:
-        warnings.append(
-            f"A possible connection between shapes {first_id} and {second_id} has no clear arrow direction; it was omitted. Review it manually."
-        )
+
     connected_ids = {
         int(node_id)
         for edge in connections
         for node_id in (edge["from"], edge["to"])
     }
-    if connections and any(int(block["id"]) not in connected_ids for block in blocks):
-        warnings.append("Some detected shapes have no confirmed arrow connection; review the graph before generating code.")
+    for block in blocks:
+        if int(block["id"]) not in connected_ids:
+            warnings.append(f"Shape #{block['id']} has no confirmed arrow connection; review the graph before generating code.")
+
     return connections, warnings
+
 
 def find_nearest_block(point, blocks, max_dist=120):
     px, py = point

@@ -21,11 +21,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+MAX_IMAGE_UPLOAD_SIZE = 15 * 1024 * 1024  # 15 MB limit
+ALLOWED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 import cv_engine
 import ocr_engine
@@ -79,7 +81,17 @@ AI_UNAVAILABLE = "AI generation is currently unavailable. Please configure the b
 
 
 def pil_from_upload(file_bytes: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    # Protect against decompression bomb attacks
+    Image.MAX_IMAGE_PIXELS = 25_000_000
+    img = Image.open(io.BytesIO(file_bytes))
+    img = ImageOps.exif_transpose(img)
+    # Composite transparent/alpha channels onto a solid white background
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        white_bg.paste(rgba, (0, 0), rgba)
+        return white_bg.convert("RGB")
+    return img.convert("RGB")
 
 
 def img_to_b64(cv_img: np.ndarray) -> str:
@@ -158,18 +170,12 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
     nodes = []
     incoming = {str(connection["to"]) for connection in connections or []}
     outgoing = {str(connection["from"]) for connection in connections or []}
-    placeholder_labels = {
-        "input_output": "Unlabeled input/output",
-        "decision": "Unlabeled decision",
-        "process": "Unlabeled process",
-        "manual_input": "Unlabeled input",
-    }
     for i, b in enumerate(blocks):
         shape_type = b.get("type", "process")
         text = b.get("text", "").strip()
-        bbox = b.get("bbox", (0, 0, 50, 50))
         cx = b.get("center", (img_width // 2, (i + 1) * 100))[0]
         cy = b.get("center", (img_width // 2, (i + 1) * 100))[1]
+        needs_review = False
         if not text:
             if shape_type == "start_end":
                 if str(b["id"]) not in incoming and str(b["id"]) in outgoing:
@@ -177,16 +183,23 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
                 elif str(b["id"]) in incoming and str(b["id"]) not in outgoing:
                     text = "End"
                 else:
-                    text = "Unlabeled start/end"
+                    text = "Needs review: unread start/end"
+                    needs_review = True
             else:
-                text = placeholder_labels.get(shape_type, "Unlabeled flowchart step")
+                text = "Needs review: unread"
+                needs_review = True
+
         x = int((cx / max(img_width, 1)) * 550) + 50
         y = int((cy / max(img_height, 1)) * 600) + 30
         nodes.append({
             "id": str(b["id"]),
             "type": NODE_TYPE_MAP.get(shape_type, "process"),
             "position": {"x": x, "y": y},
-            "data": {"label": text},
+            "data": {
+                "label": text,
+                "needs_review": needs_review,
+                "uncertain": needs_review,
+            },
         })
     return nodes
 
@@ -196,6 +209,8 @@ def connections_to_react_edges(connections) -> list:
     for i, c in enumerate(connections):
         label = c.get("branch") or ""
         handle = "yes" if str(label).lower() in ("yes", "true") else ("no" if str(label).lower() in ("no", "false") else None)
+        is_uncertain = bool(c.get("uncertain"))
+        is_unconfirmed = bool(c.get("unconfirmed_suggestion"))
         e = {
             "id": f"e_{i}",
             "source": str(c["from"]),
@@ -203,15 +218,18 @@ def connections_to_react_edges(connections) -> list:
             "type": "smoothstep",
             "animated": True,
             "label": label,
+            "style": {"strokeDasharray": "5,5"} if is_uncertain else {},
             "data": {
                 "confidence": c.get("confidence", 1.0),
-                "uncertain": bool(c.get("uncertain")),
+                "uncertain": is_uncertain,
+                "unconfirmed_suggestion": is_unconfirmed,
             },
         }
         if handle:
             e["sourceHandle"] = handle
         edges.append(e)
     return edges
+
 
 
 def parse_json_object(raw: str) -> dict:
@@ -279,20 +297,22 @@ async def analyze(
             pil_img = Image.fromarray(cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB))
         elif mode == "canvas" and canvas_data:
             img_bytes = base64.b64decode(canvas_data.split(",")[-1])
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img = pil_from_upload(img_bytes)
         elif file:
             contents = await file.read()
+            if len(contents) > MAX_IMAGE_UPLOAD_SIZE:
+                raise HTTPException(413, f"Uploaded image exceeds the {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)}MB file size limit.")
             if len(contents) < 100:
                 raise HTTPException(400, "Uploaded file appears to be empty or too small.")
             name = (file.filename or "").lower()
-            if name and not name.endswith((".png", ".jpg", ".jpeg")):
-                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, or JPEG.")
+            if name and not any(name.endswith(ext) for ext in ALLOWED_IMAGE_EXTENSIONS):
+                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, JPEG, WEBP, or BMP.")
             try:
                 pil_img = pil_from_upload(contents)
             except Exception:
-                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, or JPEG.")
+                raise HTTPException(400, "Invalid image file. Could not decode image data.")
         else:
-            raise HTTPException(400, "No image provided. Please upload a PNG, JPG, or JPEG.")
+            raise HTTPException(400, "No image provided. Please upload a PNG, JPG, JPEG, WEBP, or BMP.")
 
         norm_img = cv_engine.normalize_image(pil_img)
         h, w = norm_img.shape[:2]
@@ -313,6 +333,20 @@ async def analyze(
                 b["text"] = ""
                 ocr_failed += 1
 
+        # Optional Gemini Vision OCR fallback if local OCR missed shapes and API key is present
+        if ocr_failed > 0 and GEMINI_API_KEY:
+            try:
+                ai_texts = ocr_engine.extract_flowchart_text_with_gemini(pil_img, blocks, timeout_sec=6.0)
+                if ai_texts:
+                    for b in blocks:
+                        bid = int(b["id"])
+                        if not b.get("text") and bid in ai_texts and ai_texts[bid]:
+                            b["text"] = ai_texts[bid]
+                            ocr_failed = max(0, ocr_failed - 1)
+            except Exception as e:
+                connection_warnings.append(f"AI vision OCR fell back to local recognition: {e}")
+
+        # Branch label recognition for decision diamonds
         if ocr_engine.tesseract_available():
             blocks_by_id = {int(block["id"]): block for block in blocks}
             for connection in connections:
@@ -352,19 +386,54 @@ async def analyze(
                     w_box, h_box = 80, 48
                     box = (px - w_box // 2, py - h_box // 2, w_box, h_box)
                     txt, conf = ocr_engine.extract_region_text_with_confidence(norm_img, box)
-                    cleaned = txt.strip()
-                    if cleaned.lower() in ("yes", "ye", "y", "true"):
-                        cleaned = "Yes"
-                    elif cleaned.lower() in ("no", "n", "false"):
-                        cleaned = "No"
-                    if cleaned in ("Yes", "No") or conf >= 60:
-                        if cleaned:
-                            branch_candidates.append((cleaned, conf))
+                    cleaned = ocr_engine.clean_branch_label(txt)
+                    if cleaned in ("Yes", "No"):
+                        branch_candidates.append((cleaned, conf))
 
                 if branch_candidates:
-                    yes_no = [c for c in branch_candidates if c[0] in ("Yes", "No")]
-                    chosen = max(yes_no, key=lambda c: c[1])[0] if yes_no else max(branch_candidates, key=lambda c: c[1])[0]
+                    chosen = max(branch_candidates, key=lambda c: c[1])[0]
                     connection["branch"] = chosen
+
+        warnings = list(connection_warnings)
+
+        # Decision branches suggestion logic - Requirement 2:
+        # "Do not silently infer Yes/No branches. You may suggest a complementary branch label,
+        # but mark it uncertain and require user confirmation before generating code."
+        decision_ids = {str(block["id"]) for block in blocks if block.get("type") == "decision"}
+        for decision_id in decision_ids:
+            decision_edges = [edge for edge in connections if str(edge["from"]) == decision_id]
+            if len(decision_edges) == 2:
+                e1, e2 = decision_edges[0], decision_edges[1]
+                b1 = e1.get("branch", "")
+                b2 = e2.get("branch", "")
+                if b1 in ("Yes", "No") and not b2:
+                    comp = "No" if b1 == "Yes" else "Yes"
+                    e2["branch"] = comp
+                    e2["uncertain"] = True
+                    e2["unconfirmed_suggestion"] = True
+                    e2["confidence"] = 0.5
+                    warnings.append(
+                        f"Decision #{decision_id}: complementary branch label '{comp}' was suggested for path to shape #{e2['to']}; "
+                        "it is marked uncertain and requires user confirmation before code generation."
+                    )
+                elif b2 in ("Yes", "No") and not b1:
+                    comp = "No" if b2 == "Yes" else "Yes"
+                    e1["branch"] = comp
+                    e1["uncertain"] = True
+                    e1["unconfirmed_suggestion"] = True
+                    e1["confidence"] = 0.5
+                    warnings.append(
+                        f"Decision #{decision_id}: complementary branch label '{comp}' was suggested for path to shape #{e1['to']}; "
+                        "it is marked uncertain and requires user confirmation before code generation."
+                    )
+                elif not b1 and not b2:
+                    warnings.append(
+                        f"Branch labels for decision #{decision_id} could not be detected; please review and label the Yes and No branches."
+                    )
+            elif len(decision_edges) < 2:
+                warnings.append(
+                    f"Decision #{decision_id} has only {len(decision_edges)} outgoing branch; decisions require both Yes and No branches."
+                )
 
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
         overlay_b64 = img_to_b64(overlay)
@@ -384,11 +453,11 @@ async def analyze(
                 "branch": c.get("branch", ""),
                 "confidence": c.get("confidence", 1.0),
                 "uncertain": bool(c.get("uncertain")),
+                "unconfirmed_suggestion": bool(c.get("unconfirmed_suggestion")),
             }
             for c in connections
         ]
 
-        warnings = list(connection_warnings)
         if not ocr_engine.tesseract_available():
             warnings.append(
                 "Tesseract OCR is unavailable; node and branch labels could not be read. "
@@ -396,16 +465,23 @@ async def analyze(
             )
         elif ocr_failed:
             warnings.append(
-                f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes. "
-                "Please review and edit those node labels on the canvas."
+                f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes; marked as 'Needs review'. "
+                "Please review and edit those node labels on the canvas before generating code."
             )
-        decision_ids = {str(block["id"]) for block in blocks if block.get("type") == "decision"}
-        for decision_id in decision_ids:
-            decision_edges = [edge for edge in connections if str(edge["from"]) == decision_id]
-            if len(decision_edges) > 1 and any(not edge.get("branch") for edge in decision_edges):
-                warnings.append(
-                    f"Branch labels from decision {decision_id} could not be read; review these paths before generating code."
-                )
+
+        connected_ids = {
+            int(node_id)
+            for edge in connections
+            for node_id in (edge["from"], edge["to"])
+        }
+        missing_connections = [str(block["id"]) for block in blocks if int(block["id"]) not in connected_ids]
+        for mid in missing_connections:
+            warnings.append(f"Node #{mid} has no arrow connections.")
+
+        has_uncertain_edges = any(bool(e.get("uncertain")) or bool(e.get("unconfirmed_suggestion")) for e in connections)
+        has_needs_review_nodes = any(n.get("data", {}).get("needs_review") for n in react_nodes)
+        graph_status = "needs_review" if (has_uncertain_edges or has_needs_review_nodes or ocr_failed > 0 or missing_connections) else "verified"
+
         warning = " ".join(dict.fromkeys(warnings)) or None
 
         return JSONResponse({
@@ -416,11 +492,14 @@ async def analyze(
             "overlay_image": overlay_b64,
             "warning": warning,
             "warnings": list(dict.fromkeys(warnings)),
+            "graph_status": graph_status,
+            "missing_connections": missing_connections,
         })
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Analysis failed: {str(e)}")
+
 
 
 @app.post("/api/generate-flowchart")
@@ -478,17 +557,37 @@ async def generate_code(request_body: dict):
             raise HTTPException(400, "Canvas is empty. Please create a flowchart first.")
 
         nodes, edges = logic_engine.sanitize_graph(nodes, edges)
-        unlabeled = [
-            logic_engine.node_text(node)
-            for node in nodes
-            if not logic_engine.node_text(node)
+
+        # Check for unreadable / 'Needs review' nodes (Requirement 1)
+        needs_review_nodes = [
+            node for node in nodes
+            if (isinstance(node.get("data"), dict) and node["data"].get("needs_review"))
+            or logic_engine.node_text(node).lower().startswith("needs review")
+            or "needs review" in logic_engine.node_text(node).lower()
             or logic_engine.node_text(node).lower().startswith("unlabeled")
+            or not logic_engine.node_text(node).strip()
         ]
-        if unlabeled:
+        if needs_review_nodes:
             raise HTTPException(
                 422,
-                "Some imported flowchart labels could not be read. Edit the highlighted or unlabeled nodes, then generate Python again.",
+                "Some imported flowchart labels could not be read and are marked 'Needs review'. "
+                "Please review and correct these nodes on the canvas before generating code.",
             )
+
+        # Check for unconfirmed suggested decision branches (Requirement 2)
+        unconfirmed_edges = [
+            edge for edge in edges
+            if (isinstance(edge.get("data"), dict) and edge["data"].get("unconfirmed_suggestion"))
+            or edge.get("unconfirmed_suggestion")
+        ]
+        if unconfirmed_edges:
+            raise HTTPException(
+                422,
+                "Some decision branches have suggested labels that require user confirmation. "
+                "Please review and confirm or edit the branch labels before generating code.",
+            )
+
+        # Check for uncertain arrow connections (Requirement 5)
         uncertain_edges = [
             edge for edge in edges
             if isinstance(edge.get("data"), dict) and edge["data"].get("uncertain")
@@ -496,9 +595,11 @@ async def generate_code(request_body: dict):
         if uncertain_edges:
             raise HTTPException(
                 422,
-                "Some imported connections have uncertain arrow direction. Review or reconnect the dashed edges before generating Python.",
+                "Some imported connections have uncertain arrow direction. "
+                "Review or reconnect the dashed edges before generating Python.",
             )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
+
         code = logic_engine.compile_to_python(ast_data)
 
         warnings = []
