@@ -283,13 +283,6 @@ CRITICAL FLOWCHART LOGIC RULES:
 """
 
 
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "FlowForge AI API",
-        "ai_available": bool(GEMINI_API_KEY),
-    }
 
 
 @app.post("/api/analyze")
