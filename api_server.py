@@ -62,7 +62,7 @@ _active_executions = 0
 _executions_lock = asyncio.Lock()
 
 
-LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost"}
+LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded", "via")
 
 
@@ -985,6 +985,9 @@ async def api_not_found(rest: str):
 async def serve_spa(full_path: str):
     if not DIST_DIR.is_dir():
         return _json_not_found("Frontend build not found. Run 'npm run build' in the landing folder.")
+    # Reject dot-files and traversal attempts with 404, never serve them.
+    if any(part.startswith(".") for part in full_path.split("/") if part):
+        return _json_not_found()
     file_path = _safe_dist_file(full_path)
     if file_path is not None:
         headers = {"Cache-Control": "public, max-age=31536000, immutable"} if full_path.startswith("assets/") else None

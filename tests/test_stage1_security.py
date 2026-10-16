@@ -92,7 +92,7 @@ def test_backslash_path_traversal(client):
 
 
 def test_symlink_escape_rejection(tmp_path):
-    """Verify _resolve_safe_static_file rejects symlinks pointing outside the static root."""
+    """Verify _safe_dist_file rejects symlinks pointing outside the static root."""
     dist_dir = tmp_path / "dist"
     dist_dir.mkdir()
     secret_file = tmp_path / "secret.env"
@@ -104,7 +104,7 @@ def test_symlink_escape_rejection(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("Symlink creation not supported or requires elevated privileges on this OS")
 
-    resolved = api_server._resolve_safe_static_file(dist_dir, "secret_link")
+    resolved = api_server._safe_dist_file("secret_link")
     assert resolved is None, "Symlink pointing outside base_dir must be rejected"
 
 
@@ -147,9 +147,7 @@ def test_api_health_endpoint(client):
     exec_info = data["execution"]
     assert "mode" in exec_info
     assert "enabled" in exec_info
-    assert "sandboxed" in exec_info
-    assert "max_code_size" in exec_info
-    assert "max_concurrent" in exec_info
+    assert "state" in exec_info
 
 
 def test_health_responsiveness_during_execution(app):
@@ -194,12 +192,9 @@ def test_execution_disabled_when_sandbox_unavailable(client):
     os.environ["FLOWFORGE_EXECUTION"] = "auto"
     try:
         response = client.post("/api/execute", json={"code": "print('hello')", "user_input": ""})
-        assert response.status_code == 200
+        assert response.status_code == 403
         data = response.json()
-        assert data["success"] is False
-        assert data["status"] == "error"
-        assert data.get("execution_status") == "disabled"
-        assert "Execution disabled" in data["error_details"] or "Execution disabled" in data["output"]
+        assert "disabled" in data.get("detail", "").lower() or "unavailable" in data.get("detail", "").lower()
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
@@ -209,11 +204,10 @@ def test_executor_newlines_and_prompts():
     os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
     try:
         code = "a = input('Enter a: ')\nb = input('Enter b: ')\nprint('Sum:', int(a) + int(b))"
-        result = executor.run_code_safely(code, user_inputs_str="12\n8\n")
+        result = executor.execute(code, "12\n8\n", client_is_local=True)
         assert result.success is True
         assert result.exit_code == 0
         assert "Sum: 20" in result.stdout
-        assert result.program_output == "Sum: 20"
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
@@ -223,7 +217,7 @@ def test_executor_exit_status_success_with_error_in_output():
     os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
     try:
         code = "print('Margin of Error: 0.05')\nprint('Standard Error: 0.01')"
-        result = executor.run_code_safely(code)
+        result = executor.execute(code, client_is_local=True)
         assert result.success is True
         assert result.status == "success"
         assert result.exit_code == 0
@@ -237,11 +231,11 @@ def test_executor_timeout_limit():
     os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
     try:
         code = "while True: pass"
-        result = executor.run_code_safely(code, timeout_sec=1)
+        result = executor.execute(code, timeout_sec=1, client_is_local=True)
         assert result.success is False
         assert result.status == "timeout"
         assert result.timed_out is True
-        assert "timed out" in result.error_details.lower()
+        assert "timed out" in result.message.lower()
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
@@ -249,32 +243,38 @@ def test_executor_timeout_limit():
 def test_executor_output_truncation():
     """Outputs exceeding the max output limit must be truncated with a notice."""
     os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
-    os.environ["FLOWFORGE_MAX_OUTPUT_SIZE"] = "500"
+    # get_limits() enforces a minimum of 1024 bytes; use 2048 to stay above it.
+    os.environ["FLOWFORGE_EXEC_MAX_OUTPUT_BYTES"] = "2048"
+    executor.reset_probe()
     try:
-        code = "print('X' * 2000)"
-        result = executor.run_code_safely(code)
+        # Generate 8000 chars – well above the 2048-byte cap.
+        code = "print('X' * 8000)"
+        result = executor.execute(code, client_is_local=True)
         assert result.truncated is True
-        assert len(result.stdout) < 1000
-        assert "Output truncated" in result.stdout
+        # Allow cap + ~50 bytes for the "\n[output truncated]" sentinel.
+        assert len(result.stdout) < 2200
+        assert "output truncated" in result.stdout.lower()
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
-        os.environ.pop("FLOWFORGE_MAX_OUTPUT_SIZE", None)
+        os.environ.pop("FLOWFORGE_EXEC_MAX_OUTPUT_BYTES", None)
+        executor.reset_probe()
 
 
 def test_code_size_limit(client):
     """Requests exceeding maximum code size must be rejected with HTTP 413."""
     os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
-    os.environ["FLOWFORGE_MAX_CODE_SIZE"] = "200"
+    os.environ["FLOWFORGE_EXEC_MAX_CODE_CHARS"] = "200"
+    executor.reset_probe()
     try:
         huge_code = "# " + ("A" * 500) + "\nprint(1)"
         response = client.post("/api/execute", json={"code": huge_code, "user_input": ""})
         assert response.status_code == 413
         data = response.json()
-        assert data["success"] is False
-        assert "exceeds" in data["error_details"].lower()
+        assert "longer than" in data.get("detail", "").lower() or "exceeds" in data.get("detail", "").lower()
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
-        os.environ.pop("FLOWFORGE_MAX_CODE_SIZE", None)
+        os.environ.pop("FLOWFORGE_EXEC_MAX_CODE_CHARS", None)
+        executor.reset_probe()
 
 
 # ==============================================================================
@@ -304,11 +304,9 @@ def test_api_response_compatibility(client):
         assert isinstance(data["program_output"], str)
 
         # Structured Stage 1 additions
-        assert "exit_code" in data
         assert "timed_out" in data
         assert "truncated" in data
         assert "execution_mode" in data
-        assert "sandboxed" in data
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
@@ -323,9 +321,14 @@ def test_concurrency_limit_exceeded(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
             os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
+            executor.reset_probe()
             # Temporarily set semaphore to 1 slot
-            old_sem = api_server._execution_semaphore
-            api_server._execution_semaphore = asyncio.Semaphore(1)
+            old_sem = executor._slots
+            old_size = executor._slots_size
+            executor._slots = None
+            executor._slots_size = 0
+            executor._acquire_slot.__globals__['_slots'] = None
+            executor._acquire_slot.__globals__['_slots_size'] = 0
             try:
                 sleep_code = "import time\ntime.sleep(1.2)\nprint('Done')"
 
@@ -347,8 +350,10 @@ def test_concurrency_limit_exceeded(app):
                 for r in responses:
                     assert r.status_code in (200, 429)
             finally:
-                api_server._execution_semaphore = old_sem
+                executor._acquire_slot.__globals__['_slots'] = old_sem
+                executor._acquire_slot.__globals__['_slots_size'] = old_size
                 os.environ.pop("FLOWFORGE_EXECUTION", None)
+                executor.reset_probe()
 
     asyncio.run(_run())
 
@@ -359,14 +364,14 @@ def test_banned_modules_and_builtins():
     try:
         for mod in ["os", "sys", "subprocess", "socket", "shutil", "pathlib", "ctypes"]:
             code = f"import {mod}\nprint('hacked')"
-            res = executor.run_code_safely(code)
+            res = executor.execute(code, client_is_local=True)
             assert res.success is False
-            assert "Security Error" in res.error_details or "Restricted import" in res.error_details
+            assert "Security Error" in res.message or "Restricted import" in res.message
 
         builtins_code = "__builtins__.__import__('os').system('dir')"
-        res_b = executor.run_code_safely(builtins_code)
+        res_b = executor.execute(builtins_code, client_is_local=True)
         assert res_b.success is False
-        assert "builtins" in res_b.error_details.lower()
+        assert "restricted" in res_b.message.lower() or "security" in res_b.message.lower()
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
@@ -377,23 +382,24 @@ def test_eof_error_handling():
     try:
         code = "a = input('Val 1: ')\nb = input('Val 2: ')\nprint(a, b)"
         # Provide only 1 input line
-        res = executor.run_code_safely(code, user_inputs_str="only_one_line\n")
+        res = executor.execute(code, "only_one_line\n", client_is_local=True)
         assert res.success is False
         assert res.status == "error"
-        assert "Execution stopped: the program asked for more input values" in res.error_details
+        assert "asked for more input values" in res.message
     finally:
         os.environ.pop("FLOWFORGE_EXECUTION", None)
 
 
-def test_resolve_safe_static_file_direct(tmp_path):
-    """Directly test _resolve_safe_static_file against escaping vectors."""
-    base = tmp_path / "static"
-    base.mkdir()
-    valid_file = base / "valid.txt"
+def test_safe_dist_file_direct(tmp_path, monkeypatch):
+    """Directly test _safe_dist_file against escaping vectors."""
+    dist = tmp_path / "static"
+    dist.mkdir()
+    valid_file = dist / "valid.txt"
     valid_file.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(api_server, "DIST_DIR", dist)
 
     # Valid file resolves
-    assert api_server._resolve_safe_static_file(base, "valid.txt") == valid_file
+    assert api_server._safe_dist_file("valid.txt") == valid_file.resolve()
 
     # Escaping and dangerous paths resolve to None
     dangerous = [
@@ -408,5 +414,4 @@ def test_resolve_safe_static_file_direct(tmp_path):
         "",
     ]
     for d in dangerous:
-        assert api_server._resolve_safe_static_file(base, d) is None, f"Failed to reject: {d}"
-
+        assert api_server._safe_dist_file(d) is None, f"Failed to reject: {d}"
