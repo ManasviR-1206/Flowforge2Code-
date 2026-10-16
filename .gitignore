@@ -12,3 +12,13 @@ dist/
 .idea/
 
 .DS_Store
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing and test caches
+.pytest_cache/
+.coverage
+htmlcov/

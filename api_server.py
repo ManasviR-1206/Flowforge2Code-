@@ -3,12 +3,14 @@ FlowForge AI – Unified FastAPI Backend
 Serves the React/Vite SPA and provides all REST API endpoints.
 """
 
+import asyncio
 import ast as py_ast
 import base64
 import io
 import json
 import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+MAX_CONCURRENT_EXECUTIONS = int(os.getenv("FLOWFORGE_MAX_CONCURRENT_EXECUTIONS", "4"))
+_execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXECUTIONS)
+_active_executions = 0
+_executions_lock = asyncio.Lock()
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint reporting AI availability and execution engine status."""
+    mode = executor.get_execution_mode()
+    is_sandboxed, sandbox_type, sandbox_reason = executor.verify_sandbox_environment()
+    limits = executor.get_config_limits()
+    return JSONResponse({
+        "status": "ok",
+        "ai_available": bool(GEMINI_API_KEY),
+        "execution": {
+            "mode": os.getenv("FLOWFORGE_EXECUTION", os.getenv("FLOWFORGE_EXECUTION_MODE", "auto")),
+            "active_mode": mode,
+            "enabled": (mode != "disabled"),
+            "sandboxed": is_sandboxed,
+            "sandbox_type": sandbox_type,
+            "sandbox_reason": sandbox_reason,
+            "max_code_size": limits["max_code_size"],
+            "max_output_size": limits["max_output_size"],
+            "max_concurrent": MAX_CONCURRENT_EXECUTIONS,
+            "active_executions": _active_executions,
+            "timeout_sec": limits["timeout_sec"],
+        },
+        "backend": "FlowForge AI API",
+        "version": "3.0.0",
+    })
 
 AI_UNAVAILABLE = "AI generation is currently unavailable. Please configure the backend API key."
 
@@ -494,52 +528,123 @@ async def generate_code(request_body: dict):
 
 @app.post("/api/execute")
 async def execute_code(request_body: dict):
+    global _active_executions
     try:
         code = (request_body.get("code") or "").strip()
         user_input = request_body.get("user_input", "")
         if not code:
             raise HTTPException(400, "No code to execute. Generate Python from your flowchart first.")
+
+        limits = executor.get_config_limits()
+        max_code_size = limits["max_code_size"]
+        code_bytes = code.encode("utf-8", errors="replace")
+        if len(code_bytes) > max_code_size:
+            msg = f"Execution Error: Code size ({len(code_bytes)} bytes) exceeds the limit of {max_code_size} bytes."
+            return JSONResponse({
+                "output": msg,
+                "stdout": "",
+                "stderr": msg,
+                "status": "error",
+                "success": False,
+                "error_details": msg,
+                "program_output": "",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "execution_mode": executor.get_execution_mode(),
+                "sandboxed": False,
+            }, status_code=413)
+
+        mode = executor.get_execution_mode()
+        if mode == "disabled":
+            res = executor.run_code_safely(code, user_input)
+            return JSONResponse({
+                "output": str(res),
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "status": "error",
+                "execution_status": "disabled",
+                "success": False,
+                "error_details": res.error_details,
+                "program_output": "",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "execution_mode": "disabled",
+                "sandboxed": False,
+            })
+
+        # Pre-validate syntax
         try:
             py_ast.parse(code)
         except SyntaxError as se:
             msg = f"Syntax Error: {str(se)}"
-            return JSONResponse({"output": msg, "stdout": "", "stderr": msg, "status": "error", "success": False, "error_details": msg, "program_output": ""})
-        output = executor.run_code_safely(code, user_input, timeout_sec=5)
-        output_text = str(output or "")
-        is_error = (
-            output_text.startswith(("Execution Error", "Syntax Error", "Security Error"))
-            or "Traceback (most recent call last):" in output_text
-            or "EOFError" in output_text
-            or "Exception" in output_text
-            or "Error:" in output_text
-        )
-        status = "error" if is_error else "success"
-        stdout = output_text
-        error_details = ""
-        program_output = output_text.strip()
-        if status == "error":
-            error_details = output_text.strip()
-            program_output = ""
-        else:
-            cleaned_lines = []
-            for line in output_text.splitlines():
-                stripped = line.strip()
-                if re.fullmatch(r"Enter\s+.*?:", stripped):
-                    continue
-                if re.fullmatch(r"Enter\s+.*?:\s*", stripped):
-                    continue
-                cleaned_lines.append(line)
-            program_output = "\n".join(part for part in cleaned_lines if part.strip() or part == "").strip()
-            if not program_output:
-                program_output = output_text.strip()
+            return JSONResponse({
+                "output": msg,
+                "stdout": "",
+                "stderr": msg,
+                "status": "error",
+                "success": False,
+                "error_details": msg,
+                "program_output": "",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "execution_mode": mode,
+                "sandboxed": (mode == "sandbox"),
+            })
+
+        # Acquire concurrency semaphore without blocking the event loop
+        try:
+            await asyncio.wait_for(_execution_semaphore.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
+            return JSONResponse({
+                "output": "Execution Error: Concurrency limit reached. Server is busy executing other programs.",
+                "stdout": "",
+                "stderr": "Concurrency limit reached.",
+                "status": "error",
+                "success": False,
+                "error_details": "Server concurrency limit reached. Please retry in a few seconds.",
+                "program_output": "",
+                "execution_status": "concurrency_limit_exceeded",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "execution_mode": mode,
+                "sandboxed": (mode == "sandbox"),
+            }, status_code=429)
+
+        async with _executions_lock:
+            _active_executions += 1
+
+        try:
+            loop = asyncio.get_running_loop()
+            result: executor.ExecutionResult = await loop.run_in_executor(
+                None,
+                executor.run_code_safely,
+                code,
+                user_input,
+                limits["timeout_sec"],
+            )
+        finally:
+            _execution_semaphore.release()
+            async with _executions_lock:
+                _active_executions = max(0, _active_executions - 1)
+
+        status_field = "success" if result.success else "error"
         return JSONResponse({
-            "output": output_text,
-            "stdout": stdout,
-            "stderr": error_details if status == "error" else "",
-            "status": status,
-            "success": status == "success",
-            "error_details": error_details,
-            "program_output": program_output,
+            "output": str(result),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "status": status_field,
+            "success": result.success,
+            "error_details": result.error_details,
+            "program_output": result.program_output,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "truncated": result.truncated,
+            "execution_mode": result.execution_mode,
+            "sandboxed": result.sandboxed,
         })
     except HTTPException:
         raise
@@ -715,18 +820,124 @@ User message: {message}"""
         raise HTTPException(500, f"Chat failed: {str(e)}")
 
 
-DIST_DIR = Path(__file__).parent / "landing" / "dist"
+DIST_DIR = Path(__file__).resolve().parent / "landing" / "dist"
 
-if DIST_DIR.exists():
+if DIST_DIR.exists() and (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
 
-    @app.get("/")
-    async def serve_root():
-        return FileResponse(str(DIST_DIR / "index.html"))
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        file_path = DIST_DIR / full_path
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(DIST_DIR / "index.html"))
+@app.api_route(
+    "/api/{unmatched_path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+)
+async def handle_unknown_api_route(unmatched_path: str):
+    """Return JSON 404 for unknown /api/* endpoints instead of SPA HTML."""
+    return JSONResponse(
+        {"detail": f"API endpoint not found: /api/{unmatched_path}"},
+        status_code=404,
+    )
+
+
+def _resolve_safe_static_file(base_dir: Path, requested_path: str) -> Optional[Path]:
+    """
+    Safely resolve requested static file path within base_dir.
+    Defends against:
+      - Encoded or double-encoded directory traversal ('..', '%2e%2e', etc.)
+      - Windows backslash traversal ('\\', '%5c')
+      - Null bytes ('\0')
+      - Sensitive/hidden file patterns ('.env', '.git', etc.)
+      - Symlinks escaping base_dir
+    """
+    if not requested_path or not base_dir.exists():
+        return None
+
+    # Unquote up to 3 times to neutralize multi-layer URL encoding
+    decoded = requested_path
+    for _ in range(3):
+        prev = decoded
+        decoded = urllib.parse.unquote(decoded)
+        if decoded == prev:
+            break
+
+    # Strictly block null bytes, traversal segments, and backslashes
+    if "\0" in decoded or ".." in decoded or "\\" in decoded:
+        return None
+
+    # Disallow hidden files or sensitive directory names
+    norm_parts = Path(decoded).parts
+    for part in norm_parts:
+        if part.startswith(".") or part in ("node_modules", ".env", ".git"):
+            return None
+
+    try:
+        base_resolved = base_dir.resolve()
+        target = (base_resolved / decoded).resolve()
+        target.relative_to(base_resolved)
+        if target.is_file():
+            # Check symlink destination to ensure no escape
+            real_target = Path(os.path.realpath(target))
+            real_base = Path(os.path.realpath(base_resolved))
+            real_target.relative_to(real_base)
+            return target
+    except (ValueError, RuntimeError, OSError):
+        return None
+    return None
+
+
+def _is_suspicious_path(requested_path: str) -> bool:
+    """Check if requested path contains traversal attempts or sensitive patterns."""
+    decoded = requested_path
+    for _ in range(3):
+        prev = decoded
+        decoded = urllib.parse.unquote(decoded)
+        if decoded == prev:
+            break
+
+    if "\0" in decoded or ".." in decoded or "\\" in decoded:
+        return True
+
+    parts = Path(decoded).parts
+    for part in parts:
+        if part.startswith(".") or part in ("node_modules", ".env", ".git", "api_server.py"):
+            return True
+    return False
+
+
+@app.get("/")
+async def serve_root():
+    """Serve the root landing page index.html."""
+    index_file = DIST_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(str(index_file))
+    return JSONResponse({"detail": "Frontend assets not built"}, status_code=404)
+
+
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    """
+    Serve static files or fall back to index.html for client-side SPA routing.
+    Enforces strict path-traversal rejection and never serves HTML for /api/*.
+    """
+    # 1. Reject any route under /api
+    clean_path = full_path.lstrip("/")
+    if clean_path == "api" or clean_path.startswith("api/"):
+        return JSONResponse(
+            {"detail": f"API endpoint not found: /{clean_path}"},
+            status_code=404,
+        )
+
+    # 2. Reject path traversal attempts with 403 Forbidden
+    if _is_suspicious_path(full_path):
+        return JSONResponse({"detail": "Access forbidden"}, status_code=403)
+
+    # 3. Check for valid static file inside DIST_DIR
+    safe_file = _resolve_safe_static_file(DIST_DIR, full_path)
+    if safe_file:
+        return FileResponse(str(safe_file))
+
+    # 4. SPA route fallback (e.g. /workspace)
+    index_file = DIST_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(str(index_file))
+
+    return JSONResponse({"detail": "Not found"}, status_code=404)
