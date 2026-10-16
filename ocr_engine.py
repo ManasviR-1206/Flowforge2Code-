@@ -244,29 +244,18 @@ def extract_block_text_with_confidence(img, bbox):
     cleaned = clean_ocr_text(text)
     if confidence < 15 or not re.search(r"[A-Za-z0-9]", cleaned):
         return "", confidence
-    plausible_candidates = set()
-    for candidate_text, candidate_confidence in candidates:
-        candidate_cleaned = clean_ocr_text(candidate_text)
-        if candidate_confidence < 30 or re.search(r"[^A-Za-z0-9_+\-*/%=<>?! .\n]", candidate_cleaned):
-            continue
-        if not re.search(r"\b[A-Za-z_]\w*\s*=", candidate_cleaned) and not re.search(
-            r"(?:<=|>=|==|!=|[<>])", candidate_cleaned
-        ) and not re.search(r"\b(?:input|print|start|end)\b", candidate_cleaned, re.I):
-            continue
-        norm_cand = re.sub(r"[^a-z0-9_+\-*/%=<>?!]", "", candidate_cleaned.lower())
-        plausible_candidates.add(norm_cand)
-    if len(plausible_candidates) > 1:
-        cand_list = list(plausible_candidates)
-        has_conflict = False
-        for c1 in cand_list:
-            for c2 in cand_list:
-                if c1 != c2 and c1 not in c2 and c2 not in c1:
-                    has_conflict = True
-                    break
-            if has_conflict:
-                break
-        if has_conflict:
-            confidence = min(confidence, 49)
+    # Only penalize confidence if another high-confidence candidate genuinely contradicts the chosen reading
+    if confidence >= 50:
+        top_norm = re.sub(r"[^a-z0-9_+\-*/%=<>?!]", "", cleaned.lower())
+        for c_text, c_conf in candidates:
+            if c_conf >= max(60.0, confidence * 0.85):
+                c_clean = clean_ocr_text(c_text)
+                c_norm = re.sub(r"[^a-z0-9_+\-*/%=<>?!]", "", c_clean.lower())
+                if c_norm and top_norm and c_norm != top_norm and c_norm not in top_norm and top_norm not in c_norm:
+                    diff_chars = len(set(c_norm) ^ set(top_norm))
+                    if diff_chars >= 3:
+                        confidence = min(confidence, 49)
+                        break
     return cleaned, confidence
 
 
