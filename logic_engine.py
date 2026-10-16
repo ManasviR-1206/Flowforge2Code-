@@ -640,6 +640,14 @@ def compile_to_python(ast_data: dict) -> str:
     code = "\n".join(lines) + "\n"
     ast.parse(code)
 
+    undefined = _undefined_identifiers(code)
+    if undefined:
+        vars_str = ", ".join(sorted(repr(u) for u in undefined))
+        raise ValueError(
+            f"Flowchart is incomplete: variable(s) {vars_str} are used in conditions or operations but never defined or initialized. "
+            "Add an initialization step (e.g., an assignment or input node) on the canvas before generating code."
+        )
+
     return code
 
 
@@ -716,7 +724,7 @@ def consistency_warnings(ast_data: dict, code: str) -> list[str]:
         warnings.append(
             "Warning: The generated code reads variable(s) not defined by the flowchart: "
             + ", ".join(sorted(undefined))
-            + ". The deterministic compiler output is recommended instead."
+            + ". Ensure all variables are defined or initialized in flowchart nodes."
         )
     for node in ast_data.get("nodes", []):
         ntype = node.get("type")

@@ -472,6 +472,7 @@ export const WorkspacePage: React.FC = () => {
       setGeneratedCode(data.code || '');
       setCodeWarnings(data.warnings || []);
     } catch (e: any) {
+      setGeneratedCode('');
       setCodeWarnings([e.message]);
     }
     setLoadingCode(false);

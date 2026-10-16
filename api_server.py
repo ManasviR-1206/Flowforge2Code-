@@ -259,20 +259,27 @@ Return ONLY a JSON object (no markdown, no explanation) in this exact schema:
 {
   "nodes": [
     {"id": "1", "type": "start_end", "position": {"x": 300, "y": 50}, "data": {"label": "Start"}},
-    {"id": "2", "type": "input_output", "position": {"x": 300, "y": 150}, "data": {"label": "Input n"}}
+    {"id": "2", "type": "input_output", "position": {"x": 300, "y": 150}, "data": {"label": "Input n"}},
+    {"id": "3", "type": "process", "position": {"x": 300, "y": 250}, "data": {"label": "i = 1"}},
+    {"id": "4", "type": "decision", "position": {"x": 300, "y": 350}, "data": {"label": "i <= n?"}}
   ],
   "edges": [
     {"id": "e1-2", "source": "1", "target": "2", "type": "smoothstep", "animated": true, "label": ""},
-    {"id": "e3-4", "source": "3", "target": "4", "sourceHandle": "yes", "type": "smoothstep", "animated": true, "label": "Yes"}
+    {"id": "e2-3", "source": "2", "target": "3", "type": "smoothstep", "animated": true, "label": ""},
+    {"id": "e3-4", "source": "3", "target": "4", "type": "smoothstep", "animated": true, "label": ""},
+    {"id": "e4-5", "source": "4", "target": "5", "sourceHandle": "yes", "type": "smoothstep", "animated": true, "label": "Yes"}
   ]
 }
 
 Allowed node types: start_end, process, input_output, decision, document, predefined_process, database, manual_input, connector, offpage, delay
-- start_end: oval Start/End
-- process: rectangle
-- input_output: parallelogram (input / print)
-- decision: diamond; MUST have Yes and No outgoing edges labeled "Yes"/"No" with sourceHandle yes/no
-Always include Start and End. Layout top-to-bottom around x=300. Merge branches into shared End when they reconverge.
+- start_end: oval Start/End. Every flowchart MUST begin with Start and conclude at End.
+- process: rectangle (assignments and calculations, e.g. "fact = 1", "fact = fact * i", "i = i + 1"). Never output no-op assignments like "fact = fact".
+- input_output: parallelogram (e.g. "Input n", 'Print fact', 'Print "Even"').
+- decision: diamond; MUST have exactly two outgoing edges labeled "Yes" and "No" with sourceHandle yes/no.
+CRITICAL FLOWCHART LOGIC RULES:
+1. Every variable used in a condition or calculation MUST be initialized or input in a preceding node (e.g. "i = 1", "fact = 1", "Input n") before it is read.
+2. Every loop MUST include loop variable initialization before the decision AND a loop variable update (e.g. "i = i + 1") inside the loop body along the cycle back to the decision.
+3. Always layout top-to-bottom around x=300. Merge non-loop branches into a shared End when they finish.
 """
 
 
@@ -510,23 +517,9 @@ async def generate_flowchart(request_body: dict):
 
     local = logic_engine.prompt_to_flowchart(prompt)
     if local:
-        if not GEMINI_API_KEY:
-            return JSONResponse(local)
-        # Prefer the built-in deterministic flowchart for common teaching patterns to keep
-        # credit usage low and avoid quota failures when Gemini is rate-limited.
-        try:
-            model = get_gemini_model()
-            system_prompt = f"""You are a flowchart designer. Given a programming task, create a detailed flowchart JSON.
-The flowchart is the source of truth — do NOT emit Python code.
-
-{FLOWCHART_JSON_SCHEMA}
-
-User request: {prompt}"""
-            response = model.generate_content(system_prompt)
-            data = normalize_ai_flowchart(parse_json_object(response.text))
-            return JSONResponse(data)
-        except Exception:
-            return JSONResponse(local)
+        # Prefer the verified deterministic flowchart for standard teaching patterns to ensure
+        # full algorithm correctness, avoid missing loop steps, and avoid quota limits.
+        return JSONResponse(local)
 
     if not GEMINI_API_KEY:
         raise HTTPException(503, AI_UNAVAILABLE)
@@ -602,13 +595,6 @@ async def generate_code(request_body: dict):
 
         code = logic_engine.compile_to_python(ast_data)
 
-        warnings = []
-        try:
-            py_ast.parse(code)
-        except SyntaxError:
-            code = logic_engine.compile_to_python(ast_data)
-            warnings.append("LLM code had syntax errors; using the flowchart compiler instead.")
-
         try:
             py_ast.parse(code)
         except SyntaxError as se:
@@ -617,8 +603,22 @@ async def generate_code(request_body: dict):
                 f"The current flowchart could not be translated to valid Python: {se.msg} (line {se.lineno}).",
             )
 
-        warnings.extend(logic_engine.consistency_warnings(ast_data, code))
-        return JSONResponse({"code": code, "ast": ast_data, "warnings": warnings})
+        undefined = logic_engine._undefined_identifiers(code)
+        if undefined:
+            vars_str = ", ".join(sorted(repr(u) for u in undefined))
+            raise HTTPException(
+                422,
+                f"Flowchart is incomplete: variable(s) {vars_str} are used in conditions or operations but never defined or initialized. "
+                "Add an initialization step (e.g. an assignment or input node) on the canvas before generating code.",
+            )
+
+        warnings = list(logic_engine.consistency_warnings(ast_data, code))
+        return JSONResponse({
+            "code": code,
+            "ast": ast_data,
+            "source": "compiler",
+            "warnings": warnings,
+        })
     except HTTPException:
         raise
     except ValueError as e:
@@ -854,13 +854,31 @@ Current graph: {json.dumps({"nodes": nodes, "edges": edges})}"""
     if local and local.get("trigger") == "generate_code":
         if not nodes:
             return JSONResponse({"reply": "The canvas is empty. Add a flowchart first, then I can generate Python.", "patch": None, "trigger": None})
-        ast_data = logic_engine.build_flowchart_ast(nodes, edges)
-        code = llm_generator.generate_python_code(ast_data, GEMINI_API_KEY or None)
+        try:
+            ast_data = logic_engine.build_flowchart_ast(nodes, edges)
+            code = logic_engine.compile_to_python(ast_data)
+            undefined = logic_engine._undefined_identifiers(code)
+            if undefined:
+                vars_str = ", ".join(sorted(repr(u) for u in undefined))
+                return JSONResponse({
+                    "reply": f"The flowchart is incomplete: variable(s) {vars_str} are used in conditions or operations but never defined or initialized. Add an initialization step on the canvas first.",
+                    "patch": None,
+                    "trigger": None,
+                    "error": True,
+                })
+        except ValueError as ve:
+            return JSONResponse({
+                "reply": f"Could not generate code: {str(ve)}",
+                "patch": None,
+                "trigger": None,
+                "error": True,
+            })
         return JSONResponse({
             "reply": "Generated Python from the current flowchart. It is now in the code panel.",
             "patch": None,
             "trigger": "generate_code",
             "code": code,
+            "source": "compiler",
             "warnings": logic_engine.consistency_warnings(ast_data, code),
         })
 

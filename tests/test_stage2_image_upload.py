@@ -261,13 +261,15 @@ def test_unconfirmed_branch_suggestion_blocks_generation():
     """
     nodes = [
         {"id": "1", "type": "start_end", "position": {"x": 300, "y": 40}, "data": {"label": "Start"}},
+        {"id": "1b", "type": "input_output", "position": {"x": 300, "y": 90}, "data": {"label": "Input x"}},
         {"id": "2", "type": "decision", "position": {"x": 300, "y": 140}, "data": {"label": "x > 0"}},
         {"id": "3", "type": "input_output", "position": {"x": 150, "y": 240}, "data": {"label": "Print Pos"}},
         {"id": "4", "type": "input_output", "position": {"x": 450, "y": 240}, "data": {"label": "Print Neg"}},
         {"id": "5", "type": "start_end", "position": {"x": 300, "y": 340}, "data": {"label": "End"}},
     ]
     edges = [
-        {"id": "e1", "source": "1", "target": "2"},
+        {"id": "e0", "source": "1", "target": "1b"},
+        {"id": "e1", "source": "1b", "target": "2"},
         {"id": "e2", "source": "2", "target": "3", "sourceHandle": "yes", "label": "Yes"},
         # e3 was suggested and marked unconfirmed
         {
@@ -284,8 +286,9 @@ def test_unconfirmed_branch_suggestion_blocks_generation():
     assert "confirmation" in res.json()["detail"].lower()
 
     # Once the user confirms the branch (clearing unconfirmed_suggestion & uncertain)
-    edges[2]["data"]["unconfirmed_suggestion"] = False
-    edges[2]["data"]["uncertain"] = False
+    e3 = next(e for e in edges if e["id"] == "e3")
+    e3["data"]["unconfirmed_suggestion"] = False
+    e3["data"]["uncertain"] = False
     res2 = client.post("/api/generate-code", json={"nodes": nodes, "edges": edges})
     assert res2.status_code == 200
     assert "if x > 0:" in res2.json()["code"]
