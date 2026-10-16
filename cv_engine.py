@@ -169,6 +169,13 @@ def detect_symbols(img):
 
         shape_type = classify_shape(approx, cnt, aspect_ratio, circularity)
 
+        # Text contours can have enough area to look like a shape at low
+        # resolutions. Exclude those before nested-contour filtering so a
+        # glyph is not mistaken for an embedded flowchart symbol.
+        min_symbol_dim = max(12, int(round(18 * params["scale"])))
+        if min(bw, bh) < min_symbol_dim and shape_type not in ("connector", "offpage"):
+            continue
+
         if shape_type != "unknown":
             blocks.append({
                 "id": block_id,
