@@ -286,21 +286,51 @@ async def analyze(
                 end_block = blocks_by_id.get(int(connection["to"]))
                 if not start_block or start_block.get("type") != "decision" or connection.get("branch"):
                     continue
-                sx, sy = start_block["center"]
-                tx, ty = end_block["center"]
+
+                points_to_check = []
+                vec = connection.get("vector")
+                if vec:
+                    (vx1, vy1), (vx2, vy2) = vec
+                    for frac in (0.2, 0.4, 0.6):
+                        px = int(vx1 + (vx2 - vx1) * frac)
+                        py = int(vy1 + (vy2 - vy1) * frac)
+                        points_to_check.extend([(px, py), (px, py - 30), (px, py + 30)])
+
+                bx, by, bw, bh = start_block["bbox"]
+                cx, cy = start_block["center"]
+                tcx, tcy = end_block["center"]
+
+                if tcx < cx:
+                    lx, ly = bx, by + bh // 2
+                    points_to_check.extend([(lx - 45, ly - 30), (lx - 45, ly + 15), (lx - 30, ly - 35), (lx - 60, ly - 20)])
+                if tcx > cx:
+                    rx, ry = bx + bw, by + bh // 2
+                    points_to_check.extend([(rx + 45, ry - 30), (rx + 45, ry + 15), (rx + 30, ry - 35), (rx + 60, ry - 20)])
+                if tcy > cy:
+                    botx, boty = bx + bw // 2, by + bh
+                    points_to_check.extend([(botx - 30, boty + 30), (botx + 30, boty + 30)])
+
+                for frac in (0.3, 0.5, 0.7):
+                    points_to_check.append((int(cx + (tcx - cx) * frac), int(cy + (tcy - cy) * frac)))
+
                 branch_candidates = []
-                for fraction in (0.3, 0.5, 0.7):
-                    x = int(sx + (tx - sx) * fraction)
-                    y = int(sy + (ty - sy) * fraction)
-                    label, confidence = ocr_engine.extract_region_text_with_confidence(
-                        norm_img, (x - 36, y - 22, 72, 44)
-                    )
-                    if label:
-                        branch_candidates.append((label, confidence))
+                for px, py in points_to_check:
+                    w_box, h_box = 80, 48
+                    box = (px - w_box // 2, py - h_box // 2, w_box, h_box)
+                    txt, conf = ocr_engine.extract_region_text_with_confidence(norm_img, box)
+                    cleaned = txt.strip()
+                    if cleaned.lower() in ("yes", "ye", "y", "true"):
+                        cleaned = "Yes"
+                    elif cleaned.lower() in ("no", "n", "false"):
+                        cleaned = "No"
+                    if cleaned in ("Yes", "No") or conf >= 60:
+                        if cleaned:
+                            branch_candidates.append((cleaned, conf))
+
                 if branch_candidates:
-                    label, confidence = max(branch_candidates, key=lambda candidate: candidate[1])
-                    if confidence >= 60:
-                        connection["branch"] = label
+                    yes_no = [c for c in branch_candidates if c[0] in ("Yes", "No")]
+                    chosen = max(yes_no, key=lambda c: c[1])[0] if yes_no else max(branch_candidates, key=lambda c: c[1])[0]
+                    connection["branch"] = chosen
 
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
         overlay_b64 = img_to_b64(overlay)

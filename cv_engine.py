@@ -215,6 +215,14 @@ def filter_overlapping_blocks(blocks):
 
     return kept
 
+def is_duplicate_reverse(v1, v2):
+    if not v1 or not v2:
+        return True
+    (p1, p2), (q1, q2) = v1, v2
+    d1 = np.hypot(p1[0] - q2[0], p1[1] - q2[1])
+    d2 = np.hypot(p2[0] - q1[0], p2[1] - q1[1])
+    return d1 < 40 and d2 < 40
+
 def detect_connections(thresh_img, blocks):
     """
     Detects directed line segments and uses connected routes to recover loop-back
@@ -225,16 +233,23 @@ def detect_connections(thresh_img, blocks):
     if len(blocks) < 2:
         return connections, warnings
 
-    # Leave arrowheads outside symbol borders visible for direction scoring.
+    # Pad 5 clears symbol boundaries (including thick strokes, curved oval arcs,
+    # and diamond corners) so shapes don't bridge into connectors or skew ink scoring.
     mask = thresh_img.copy()
     for block in blocks:
         x, y, w, h = block["bbox"]
-        cv2.rectangle(mask, (max(0, x - 2), max(0, y - 2)), (x + w + 2, y + h + 2), 0, -1)
+        pad = 5
+        cv2.rectangle(mask, (max(0, x - pad), max(0, y - pad)), (x + w + pad, y + h + pad), 0, -1)
     lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=10)
     votes: dict[tuple[int, int], Counter] = defaultdict(Counter)
     vectors: dict[tuple[int, int], dict[tuple[int, int], tuple]] = defaultdict(dict)
     unresolved_pairs = set()
     seen_segments = set()
+
+    def endpoint_ink(x: int, y: int) -> int:
+        radius = 8
+        crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
+        return int(np.count_nonzero(crop))
 
     if lines is not None:
         for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
@@ -249,25 +264,34 @@ def detect_connections(thresh_img, blocks):
             if not first or not second or first["id"] == second["id"]:
                 continue
 
-            def endpoint_ink(x: int, y: int) -> int:
-                radius = 5
-                crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
-                return int(np.count_nonzero(crop))
-
             first_ink = endpoint_ink(x1, y1)
             second_ink = endpoint_ink(x2, y2)
             pair = tuple(sorted((int(first["id"]), int(second["id"]))))
-            if abs(first_ink - second_ink) < 8:
-                if np.hypot(x2 - x1, y2 - y1) >= 30:
-                    unresolved_pairs.add(pair)
-                continue
 
-            if first_ink > second_ink:
-                source, target = second, first
-                vector = ((x2, y2), (x1, y1))
+            if abs(first_ink - second_ink) >= 6:
+                if first_ink > second_ink:
+                    source, target = second, first
+                    vector = ((x2, y2), (x1, y1))
+                else:
+                    source, target = first, second
+                    vector = ((x1, y1), (x2, y2))
             else:
-                source, target = first, second
-                vector = ((x1, y1), (x2, y2))
+                # Top-to-bottom flowchart convention fallback when ink is balanced
+                f_type, s_type = first.get("type"), second.get("type")
+                if f_type == "start_end" and first["center"][1] < second["center"][1]:
+                    source, target = first, second
+                elif s_type == "start_end" and second["center"][1] < first["center"][1]:
+                    source, target = second, first
+                elif f_type == "start_end" and first["center"][1] > second["center"][1]:
+                    source, target = second, first
+                elif s_type == "start_end" and second["center"][1] > first["center"][1]:
+                    source, target = first, second
+                elif first["center"][1] <= second["center"][1]:
+                    source, target = first, second
+                else:
+                    source, target = second, first
+                vector = ((x1, y1), (x2, y2)) if source["id"] == first["id"] else ((x2, y2), (x1, y1))
+
             direction = (int(source["id"]), int(target["id"]))
             votes[pair][direction] += 1
             vectors[pair][direction] = vector
@@ -275,28 +299,21 @@ def detect_connections(thresh_img, blocks):
     for pair, direction_votes in votes.items():
         total = sum(direction_votes.values())
         ranked = direction_votes.most_common()
-        if len(ranked) > 1 and ranked[0][1] == ranked[1][1] and ranked[0][1] >= 2:
-            directions = [direction for direction, count in ranked if count >= 2]
-        else:
-            directions = [ranked[0][0]]
+        best_dir, best_count = ranked[0]
+        confidence = best_count / total
+        if confidence < 0.5:
+            unresolved_pairs.add(pair)
+            continue
+        connections.append({
+            "from": best_dir[0],
+            "to": best_dir[1],
+            "vector": vectors[pair][best_dir],
+            "branch": "",
+            "confidence": round(confidence, 2),
+            "uncertain": False,
+        })
 
-        for direction in directions:
-            count = direction_votes[direction]
-            confidence = count / total
-            if confidence < 0.67:
-                unresolved_pairs.add(pair)
-                continue
-            connections.append({
-                "from": direction[0],
-                "to": direction[1],
-                "vector": vectors[pair][direction],
-                "branch": "",
-                "confidence": round(confidence, 2),
-                "uncertain": False,
-            })
-
-    # A right-angle loop-back is often split into separate Hough segments.
-    # Recover it from a continuous connector component touching exactly two nodes.
+    # Connected component route recovery for multi-segment, loop-back, and merging routes
     route_mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
@@ -308,7 +325,7 @@ def detect_connections(thresh_img, blocks):
     routed_pairs = set()
     for component_id in range(1, component_count):
         component_x, component_y, component_w, component_h, area = component_stats[component_id]
-        if area < 15:
+        if area < 30:
             continue
         component = component_labels[
             component_y:component_y + component_h,
@@ -326,53 +343,65 @@ def detect_connections(thresh_img, blocks):
             distances = np.hypot(dx, dy)
             index = int(np.argmin(distances))
             distance = float(distances[index])
-            if distance <= 8:
-                endpoints.append((block, int(xs[index]), int(ys[index]), distance))
+            if distance <= 15:
+                ex, ey = int(xs[index]), int(ys[index])
+                radius = 10
+                crop = mask[max(0, ey - radius):ey + radius + 1, max(0, ex - radius):ex + radius + 1]
+                ink = int(np.count_nonzero(crop))
+                endpoints.append({
+                    "block": block,
+                    "point": (ex, ey),
+                    "dist": distance,
+                    "ink": ink,
+                })
 
-        if len(endpoints) != 2:
+        if len(endpoints) < 2:
             continue
 
-        first, second = endpoints
-        pair = tuple(sorted((int(first[0]["id"]), int(second[0]["id"]))))
-        route_start = np.array([first[1], first[2]], dtype=np.float32)
-        route_end = np.array([second[1], second[2]], dtype=np.float32)
-        def route_ink(endpoint) -> int:
-            _, x, y, _ = endpoint
-            radius = 10
-            crop = mask[max(0, y - radius):y + radius + 1, max(0, x - radius):x + radius + 1]
-            return int(np.count_nonzero(crop))
+        # Highest ink is the arrowhead/target; lower ink endpoints are sources
+        endpoints.sort(key=lambda ep: ep["ink"], reverse=True)
 
-        first_ink = route_ink(first)
-        second_ink = route_ink(second)
-        if abs(first_ink - second_ink) < max(8, int(max(first_ink, second_ink) * 0.2)):
-            unresolved_pairs.add(pair)
-            continue
+        if len(endpoints) == 2:
+            target_ep = endpoints[0]
+            source_ep = endpoints[1]
+            t_block = target_ep["block"]
+            s_block = source_ep["block"]
+            if t_block.get("type") == "start_end" and t_block["center"][1] < s_block["center"][1]:
+                target_ep, source_ep = source_ep, target_ep
 
-        route_confidence = abs(first_ink - second_ink) / max(first_ink, second_ink)
-        if route_confidence < 0.2:
-            unresolved_pairs.add(pair)
-            continue
+            diff = target_ep["ink"] - source_ep["ink"]
+            conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2)))
+            dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
+            pair = tuple(sorted(dir_pair))
+            routed_pairs.add(pair)
 
-        routed_pairs.add(pair)
-        if first_ink > second_ink:
-            source, target = second, first
-        else:
-            source, target = first, second
-        direction = (int(source[0]["id"]), int(target[0]["id"]))
-        if not any(
-            int(edge["from"]) == direction[0] and int(edge["to"]) == direction[1]
-            for edge in connections
-        ):
             connections.append({
-                "from": direction[0],
-                "to": direction[1],
-                "vector": ((source[1], source[2]), (target[1], target[2])),
+                "from": dir_pair[0],
+                "to": dir_pair[1],
+                "vector": (source_ep["point"], target_ep["point"]),
                 "branch": "",
-                "confidence": round(route_confidence, 2),
+                "confidence": conf,
                 "uncertain": False,
             })
+        else:
+            # Multi-endpoint (merging branches or loopback T-junctions)
+            target_ep = endpoints[0]
+            for source_ep in endpoints[1:]:
+                dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
+                pair = tuple(sorted(dir_pair))
+                routed_pairs.add(pair)
+                connections.append({
+                    "from": dir_pair[0],
+                    "to": dir_pair[1],
+                    "vector": (source_ep["point"], target_ep["point"]),
+                    "branch": "",
+                    "confidence": 0.8,
+                    "uncertain": False,
+                })
 
     unresolved_pairs.difference_update(routed_pairs)
+
+    connections = deduplicate_connections(connections)
 
     if not connections:
         warnings.append("No directed arrows could be reconstructed confidently. Connect the detected nodes manually.")
@@ -405,13 +434,20 @@ def find_nearest_block(point, blocks, max_dist=120):
     return best
 
 def deduplicate_connections(connections):
-    seen = set()
     unique = []
     for c in connections:
-        pair = (c["from"], c["to"], c.get("branch") or "")
-        if pair not in seen:
-            seen.add(pair)
-            unique.append(c)
+        # Avoid exact duplicate edges
+        if any(u["from"] == c["from"] and u["to"] == c["to"] for u in unique):
+            continue
+        # Check if reverse edge already exists on the same physical path
+        rev = (c["to"], c["from"])
+        existing_rev = [u for u in unique if u["from"] == rev[0] and u["to"] == rev[1]]
+        if existing_rev and is_duplicate_reverse(existing_rev[0].get("vector"), c.get("vector")):
+            if c.get("confidence", 0) > existing_rev[0].get("confidence", 0):
+                unique.remove(existing_rev[0])
+                unique.append(c)
+            continue
+        unique.append(c)
     return unique
 
 def overlay_detections(img, blocks, connections):
