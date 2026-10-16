@@ -12,16 +12,17 @@ import logging
 import os
 import re
 import urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,7 +39,14 @@ import logic_engine
 import llm_generator
 import executor
 
-app = FastAPI(title="FlowForge AI API", version="3.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Verify the execution sandbox in the background so the first Run click is not slow.
+    executor.warm_up()
+    yield
+
+
+app = FastAPI(title="FlowForge AI API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,28 +62,31 @@ _active_executions = 0
 _executions_lock = asyncio.Lock()
 
 
+LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost"}
+PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded", "via")
+
+
+def _request_is_local(request: Request) -> bool:
+    """True only for a direct connection from this machine (no reverse-proxy headers).
+
+    Best-effort guard used ONLY for the unsafe `local-dev` execution mode, so that it
+    cannot serve strangers by accident. It is not a substitute for not deploying that mode.
+    """
+    client = request.client.host if request.client else ""
+    if client not in LOCAL_CLIENT_HOSTS:
+        return False
+    return not any(header in request.headers for header in PROXY_HEADERS)
+
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint reporting AI availability and execution engine status."""
-    mode = executor.get_execution_mode()
-    is_sandboxed, sandbox_type, sandbox_reason = executor.verify_sandbox_environment()
-    limits = executor.get_config_limits()
+    exec_status = executor.execution_status(block=False)
+    limits = executor.get_limits()
     return JSONResponse({
         "status": "ok",
         "ai_available": bool(GEMINI_API_KEY),
-        "execution": {
-            "mode": os.getenv("FLOWFORGE_EXECUTION", os.getenv("FLOWFORGE_EXECUTION_MODE", "auto")),
-            "active_mode": mode,
-            "enabled": (mode != "disabled"),
-            "sandboxed": is_sandboxed,
-            "sandbox_type": sandbox_type,
-            "sandbox_reason": sandbox_reason,
-            "max_code_size": limits["max_code_size"],
-            "max_output_size": limits["max_output_size"],
-            "max_concurrent": MAX_CONCURRENT_EXECUTIONS,
-            "active_executions": _active_executions,
-            "timeout_sec": limits["timeout_sec"],
-        },
+        "execution": exec_status,
         "backend": "FlowForge AI API",
         "version": "3.0.0",
     })
@@ -686,124 +697,59 @@ async def generate_code(request_body: dict):
 
 
 @app.post("/api/execute")
-async def execute_code(request_body: dict):
-    global _active_executions
+async def execute_code(request: Request, request_body: dict):
     try:
-        code = (request_body.get("code") or "").strip()
+        raw_code = request_body.get("code") or ""
         user_input = request_body.get("user_input", "")
+        if user_input is None:
+            user_input = ""
+        if not isinstance(raw_code, str) or not isinstance(user_input, str):
+            raise HTTPException(422, "Both 'code' and 'user_input' must be strings.")
+        code = raw_code.strip()
         if not code:
             raise HTTPException(400, "No code to execute. Generate Python from your flowchart first.")
 
-        limits = executor.get_config_limits()
-        max_code_size = limits["max_code_size"]
-        code_bytes = code.encode("utf-8", errors="replace")
-        if len(code_bytes) > max_code_size:
-            msg = f"Execution Error: Code size ({len(code_bytes)} bytes) exceeds the limit of {max_code_size} bytes."
-            return JSONResponse({
-                "output": msg,
-                "stdout": "",
-                "stderr": msg,
-                "status": "error",
-                "success": False,
-                "error_details": msg,
-                "program_output": "",
-                "exit_code": None,
-                "timed_out": False,
-                "truncated": False,
-                "execution_mode": executor.get_execution_mode(),
-                "sandboxed": False,
-            }, status_code=413)
+        # Blocking work (sandbox + subprocess) runs in the thread pool so it cannot freeze the server.
+        result = await run_in_threadpool(executor.execute, code, user_input, 5, _request_is_local(request))
+        if result.status == "disabled":
+            raise HTTPException(403, result.message)
+        if result.status == "busy":
+            raise HTTPException(429, result.message, headers={"Retry-After": "2"})
+        if result.status == "too_large":
+            raise HTTPException(413, result.message)
 
-        mode = executor.get_execution_mode()
-        if mode == "disabled":
-            res = executor.run_code_safely(code, user_input)
-            return JSONResponse({
-                "output": str(res),
-                "stdout": res.stdout,
-                "stderr": res.stderr,
-                "status": "error",
-                "execution_status": "disabled",
-                "success": False,
-                "error_details": res.error_details,
-                "program_output": "",
-                "exit_code": None,
-                "timed_out": False,
-                "truncated": False,
-                "execution_mode": "disabled",
-                "sandboxed": False,
-            })
-
-        # Pre-validate syntax
-        try:
-            py_ast.parse(code)
-        except SyntaxError as se:
-            msg = f"Syntax Error: {str(se)}"
-            return JSONResponse({
-                "output": msg,
-                "stdout": "",
-                "stderr": msg,
-                "status": "error",
-                "success": False,
-                "error_details": msg,
-                "program_output": "",
-                "exit_code": None,
-                "timed_out": False,
-                "truncated": False,
-                "execution_mode": mode,
-                "sandboxed": (mode == "sandbox"),
-            })
-
-        # Acquire concurrency semaphore without blocking the event loop
-        try:
-            await asyncio.wait_for(_execution_semaphore.acquire(), timeout=5.0)
-        except asyncio.TimeoutError:
-            return JSONResponse({
-                "output": "Execution Error: Concurrency limit reached. Server is busy executing other programs.",
-                "stdout": "",
-                "stderr": "Concurrency limit reached.",
-                "status": "error",
-                "success": False,
-                "error_details": "Server concurrency limit reached. Please retry in a few seconds.",
-                "program_output": "",
-                "execution_status": "concurrency_limit_exceeded",
-                "exit_code": None,
-                "timed_out": False,
-                "truncated": False,
-                "execution_mode": mode,
-                "sandboxed": (mode == "sandbox"),
-            }, status_code=429)
-
-        async with _executions_lock:
-            _active_executions += 1
-
-        try:
-            loop = asyncio.get_running_loop()
-            result: executor.ExecutionResult = await loop.run_in_executor(
-                None,
-                executor.run_code_safely,
-                code,
-                user_input,
-                limits["timeout_sec"],
-            )
-        finally:
-            _execution_semaphore.release()
-            async with _executions_lock:
-                _active_executions = max(0, _active_executions - 1)
-
-        status_field = "success" if result.success else "error"
+        output_text = result.legacy_output()
+        status = "success" if result.success else "error"
+        stdout = "" if result.status == "rejected" else output_text
+        error_details = ""
+        program_output = output_text.strip()
+        if status == "error":
+            error_details = output_text.strip()
+            program_output = ""
+        else:
+            cleaned_lines = []
+            for line in output_text.splitlines():
+                stripped = line.strip()
+                if re.fullmatch(r"Enter\s+.*?:", stripped):
+                    continue
+                if re.fullmatch(r"Enter\s+.*?:\s*", stripped):
+                    continue
+                cleaned_lines.append(line)
+            program_output = "\n".join(part for part in cleaned_lines if part.strip() or part == "").strip()
+            if not program_output:
+                program_output = output_text.strip()
         return JSONResponse({
-            "output": str(result),
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "status": status_field,
-            "success": result.success,
-            "error_details": result.error_details,
-            "program_output": result.program_output,
-            "exit_code": result.exit_code,
+            "output": output_text,
+            "stdout": stdout,
+            "stderr": error_details if status == "error" else "",
+            "status": status,
+            "success": status == "success",
+            "error_details": error_details,
+            "program_output": program_output,
+            # additive fields (the original contract above is unchanged)
             "timed_out": result.timed_out,
             "truncated": result.truncated,
-            "execution_mode": result.execution_mode,
-            "sandboxed": result.sandboxed,
+            "execution_mode": result.mode,
         })
     except HTTPException:
         raise
@@ -999,122 +945,57 @@ User message: {message}"""
 
 DIST_DIR = Path(__file__).resolve().parent / "landing" / "dist"
 
-if DIST_DIR.exists() and (DIST_DIR / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
+
+def _json_not_found(detail: str = "Not Found") -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=404)
 
 
-@app.api_route(
-    "/api/{unmatched_path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
-)
-async def handle_unknown_api_route(unmatched_path: str):
-    """Return JSON 404 for unknown /api/* endpoints instead of SPA HTML."""
-    return JSONResponse(
-        {"detail": f"API endpoint not found: /api/{unmatched_path}"},
-        status_code=404,
-    )
+def _safe_dist_file(relative: str) -> Optional[Path]:
+    """Return a regular file strictly inside DIST_DIR, or None.
 
-
-def _resolve_safe_static_file(base_dir: Path, requested_path: str) -> Optional[Path]:
+    The original handler joined the raw URL path onto DIST_DIR, so a request such as
+    /%2e%2e/%2e%2e/.env served files outside the build folder (including .env).
+    Here the path is fully resolved (this follows symlinks and '..') and must still be
+    inside DIST_DIR. Dot-files and dot-directories are never served.
     """
-    Safely resolve requested static file path within base_dir.
-    Defends against:
-      - Encoded or double-encoded directory traversal ('..', '%2e%2e', etc.)
-      - Windows backslash traversal ('\\', '%5c')
-      - Null bytes ('\0')
-      - Sensitive/hidden file patterns ('.env', '.git', etc.)
-      - Symlinks escaping base_dir
-    """
-    if not requested_path or not base_dir.exists():
+    if "\x00" in relative or "\\" in relative:
         return None
-
-    # Unquote up to 3 times to neutralize multi-layer URL encoding
-    decoded = requested_path
-    for _ in range(3):
-        prev = decoded
-        decoded = urllib.parse.unquote(decoded)
-        if decoded == prev:
-            break
-
-    # Strictly block null bytes, traversal segments, and backslashes
-    if "\0" in decoded or ".." in decoded or "\\" in decoded:
+    if any(part.startswith(".") for part in relative.split("/") if part):
         return None
-
-    # Disallow hidden files or sensitive directory names
-    norm_parts = Path(decoded).parts
-    for part in norm_parts:
-        if part.startswith(".") or part in ("node_modules", ".env", ".git"):
-            return None
-
     try:
-        base_resolved = base_dir.resolve()
-        target = (base_resolved / decoded).resolve()
-        target.relative_to(base_resolved)
-        if target.is_file():
-            # Check symlink destination to ensure no escape
-            real_target = Path(os.path.realpath(target))
-            real_base = Path(os.path.realpath(base_resolved))
-            real_target.relative_to(real_base)
-            return target
-    except (ValueError, RuntimeError, OSError):
+        root = DIST_DIR.resolve()
+        candidate = (root / relative).resolve()
+        candidate.relative_to(root)
+    except (ValueError, OSError, RuntimeError):
         return None
-    return None
+    return candidate if candidate.is_file() else None
 
 
-def _is_suspicious_path(requested_path: str) -> bool:
-    """Check if requested path contains traversal attempts or sensitive patterns."""
-    decoded = requested_path
-    for _ in range(3):
-        prev = decoded
-        decoded = urllib.parse.unquote(decoded)
-        if decoded == prev:
-            break
-
-    if "\0" in decoded or ".." in decoded or "\\" in decoded:
-        return True
-
-    parts = Path(decoded).parts
-    for part in parts:
-        if part.startswith(".") or part in ("node_modules", ".env", ".git", "api_server.py"):
-            return True
-    return False
+# Any /api/* path that no route above handled is a JSON 404, never the frontend HTML.
+@app.api_route(
+    "/api/{rest:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    include_in_schema=False,
+)
+async def api_not_found(rest: str):
+    return _json_not_found()
 
 
-@app.get("/")
-async def serve_root():
-    """Serve the root landing page index.html."""
-    index_file = DIST_DIR / "index.html"
-    if index_file.is_file():
-        return FileResponse(str(index_file))
-    return JSONResponse({"detail": "Frontend assets not built"}, status_code=404)
-
-
-@app.get("/{full_path:path}")
+@app.get("/{full_path:path}", include_in_schema=False)
 async def serve_spa(full_path: str):
-    """
-    Serve static files or fall back to index.html for client-side SPA routing.
-    Enforces strict path-traversal rejection and never serves HTML for /api/*.
-    """
-    # 1. Reject any route under /api
-    clean_path = full_path.lstrip("/")
-    if clean_path == "api" or clean_path.startswith("api/"):
-        return JSONResponse(
-            {"detail": f"API endpoint not found: /{clean_path}"},
-            status_code=404,
-        )
-
-    # 2. Reject path traversal attempts with 403 Forbidden
-    if _is_suspicious_path(full_path):
-        return JSONResponse({"detail": "Access forbidden"}, status_code=403)
-
-    # 3. Check for valid static file inside DIST_DIR
-    safe_file = _resolve_safe_static_file(DIST_DIR, full_path)
-    if safe_file:
-        return FileResponse(str(safe_file))
-
-    # 4. SPA route fallback (e.g. /workspace)
-    index_file = DIST_DIR / "index.html"
-    if index_file.is_file():
-        return FileResponse(str(index_file))
+    if not DIST_DIR.is_dir():
+        return _json_not_found("Frontend build not found. Run 'npm run build' in the landing folder.")
+    file_path = _safe_dist_file(full_path)
+    if file_path is not None:
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"} if full_path.startswith("assets/") else None
+        return FileResponse(str(file_path), headers=headers)
+    # Missing assets and anything that looks like a file must 404, not return index.html.
+    last_segment = full_path.rsplit("/", 1)[-1]
+    if full_path.startswith("assets/") or "." in last_segment:
+        return _json_not_found()
+    index = _safe_dist_file("index.html")
+    if index is None:
+        return _json_not_found("Frontend build not found. Run 'npm run build' in the landing folder.")
+    return FileResponse(str(index))
 
     return JSONResponse({"detail": "Not found"}, status_code=404)
