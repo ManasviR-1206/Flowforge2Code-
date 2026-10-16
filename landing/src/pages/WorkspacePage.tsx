@@ -229,7 +229,10 @@ export const WorkspacePage: React.FC = () => {
   }, [nodes.length]);
 
   const addLabelChange = useCallback((nid: string, newLabel: string) => {
-    setNodes(prev => prev.map(n => n.id === nid ? { ...n, data: { ...n.data, label: newLabel } } : n));
+    setNodes(prev => prev.map(n => n.id === nid ? {
+      ...n,
+      data: { ...n.data, label: newLabel, needs_review: false, uncertain: false },
+    } : n));
     setFitRevision(revision => revision + 1);
   }, []);
 
@@ -270,6 +273,7 @@ export const WorkspacePage: React.FC = () => {
       ...e,
       label,
       sourceHandle: handle,
+      data: { ...e.data, uncertain: false, unconfirmed_suggestion: false },
       ...edgeLook(label),
     } : e));
   };
@@ -796,7 +800,10 @@ export const WorkspacePage: React.FC = () => {
               <input
                 key={selectedEdge.id}
                 defaultValue={String(selectedEdge.label || '')}
-                onBlur={e => setEdgeBranch(selectedEdge.id, e.target.value.trim())}
+                onBlur={e => {
+                  const label = e.target.value.trim();
+                  if (label !== String(selectedEdge.label || '')) setEdgeBranch(selectedEdge.id, label);
+                }}
                 placeholder="Custom branch label"
                 aria-label="Custom branch label"
                 className="w-full bg-slate-900 border border-slate-700 text-[10px] rounded px-2 py-1.5 outline-none focus:border-cyan-500"

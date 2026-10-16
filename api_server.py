@@ -8,6 +8,7 @@ import ast as py_ast
 import base64
 import io
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -24,10 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 load_dotenv(BASE_DIR / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MAX_IMAGE_UPLOAD_SIZE = 15 * 1024 * 1024  # 15 MB limit
 ALLOWED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+OCR_REVIEW_CONFIDENCE = 50
 
 import cv_engine
 import ocr_engine
@@ -175,7 +178,7 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
         text = b.get("text", "").strip()
         cx = b.get("center", (img_width // 2, (i + 1) * 100))[0]
         cy = b.get("center", (img_width // 2, (i + 1) * 100))[1]
-        needs_review = False
+        needs_review = bool(b.get("text_uncertain"))
         if not text:
             if shape_type == "start_end":
                 if str(b["id"]) not in incoming and str(b["id"]) in outgoing:
@@ -184,7 +187,7 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
                     text = "End"
                 else:
                     text = "Needs review: unread start/end"
-                    needs_review = True
+                needs_review = True
             else:
                 text = "Needs review: unread"
                 needs_review = True
@@ -199,6 +202,7 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
                 "label": text,
                 "needs_review": needs_review,
                 "uncertain": needs_review,
+                "confidence": b.get("text_confidence", -1),
             },
         })
     return nodes
@@ -206,7 +210,11 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
 
 def connections_to_react_edges(connections) -> list:
     edges = []
-    for i, c in enumerate(connections):
+    ordered = sorted(
+        connections,
+        key=lambda c: (str(c["from"]), str(c["to"]), str(c.get("branch") or "")),
+    )
+    for i, c in enumerate(ordered):
         label = c.get("branch") or ""
         handle = "yes" if str(label).lower() in ("yes", "true") else ("no" if str(label).lower() in ("no", "false") else None)
         is_uncertain = bool(c.get("uncertain"))
@@ -316,22 +324,53 @@ async def analyze(
 
         norm_img = cv_engine.normalize_image(pil_img)
         h, w = norm_img.shape[:2]
+        logger.info("Image preprocessing complete: %dx%d", w, h)
         blocks, thresh = cv_engine.detect_symbols(norm_img)
 
         if not blocks:
             raise HTTPException(422, "No flowchart symbols detected. Please ensure the image contains clear shapes.")
 
+        shape_counts = {}
+        for block in blocks:
+            shape_type = block.get("type", "unknown")
+            shape_counts[shape_type] = shape_counts.get(shape_type, 0) + 1
+        logger.info(
+            "Shape detection complete: %d shapes (%s)",
+            len(blocks),
+            ", ".join(f"{shape_type}={count}" for shape_type, count in sorted(shape_counts.items())),
+        )
         connections, connection_warnings = cv_engine.detect_connections(thresh, blocks)
+        logger.info(
+            "Connection reconstruction complete: %d directed connections, %d uncertain",
+            len(connections),
+            sum(bool(connection.get("uncertain")) for connection in connections),
+        )
 
         ocr_failed = 0
+        ocr_uncertain = 0
         for b in blocks:
             try:
-                b["text"] = ocr_engine.extract_block_text(norm_img, b["bbox"])
+                b["text"], b["text_confidence"] = ocr_engine.extract_block_text_with_confidence(
+                    norm_img, b["bbox"]
+                )
+                b["text_uncertain"] = (
+                    not b["text"] or b["text_confidence"] < OCR_REVIEW_CONFIDENCE
+                )
                 if not b["text"]:
                     ocr_failed += 1
-            except Exception:
+                if b["text_uncertain"]:
+                    ocr_uncertain += 1
+                logger.debug(
+                    "OCR shape #%s (%s): confidence %.1f, text=%r",
+                    b["id"], b.get("type"), b["text_confidence"], b["text"],
+                )
+            except Exception as e:
                 b["text"] = ""
+                b["text_confidence"] = -1
+                b["text_uncertain"] = True
                 ocr_failed += 1
+                ocr_uncertain += 1
+                logger.warning("OCR failed for detected shape #%s: %s", b["id"], e)
 
         # Optional Gemini Vision OCR fallback if local OCR missed shapes and API key is present
         if ocr_failed > 0 and GEMINI_API_KEY:
@@ -342,7 +381,9 @@ async def analyze(
                         bid = int(b["id"])
                         if not b.get("text") and bid in ai_texts and ai_texts[bid]:
                             b["text"] = ai_texts[bid]
+                            b["text_uncertain"] = True
                             ocr_failed = max(0, ocr_failed - 1)
+                            ocr_uncertain += 1
             except Exception as e:
                 connection_warnings.append(f"AI vision OCR fell back to local recognition: {e}")
 
@@ -427,12 +468,25 @@ async def analyze(
                         "it is marked uncertain and requires user confirmation before code generation."
                     )
                 elif not b1 and not b2:
+                    e1["uncertain"] = True
+                    e2["uncertain"] = True
+                    e1["confidence"] = min(float(e1.get("confidence", 1)), 0.5)
+                    e2["confidence"] = min(float(e2.get("confidence", 1)), 0.5)
                     warnings.append(
-                        f"Branch labels for decision #{decision_id} could not be detected; please review and label the Yes and No branches."
+                        f"Branch labels for decision #{decision_id} could not be detected; both connections are marked for review. "
+                        "Please label the Yes and No branches."
                     )
             elif len(decision_edges) < 2:
+                for edge in decision_edges:
+                    edge["uncertain"] = True
                 warnings.append(
                     f"Decision #{decision_id} has only {len(decision_edges)} outgoing branch; decisions require both Yes and No branches."
+                )
+            elif len(decision_edges) > 2:
+                for edge in decision_edges:
+                    edge["uncertain"] = True
+                warnings.append(
+                    f"Decision #{decision_id} has {len(decision_edges)} outgoing connections; review the branch structure."
                 )
 
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
@@ -468,6 +522,11 @@ async def analyze(
                 f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes; marked as 'Needs review'. "
                 "Please review and edit those node labels on the canvas before generating code."
             )
+        if ocr_uncertain and ocr_uncertain > ocr_failed:
+            warnings.append(
+                f"OCR confidence is low for {ocr_uncertain - ocr_failed} detected shape label(s). "
+                "Review and confirm those labels on the canvas before generating code."
+            )
 
         connected_ids = {
             int(node_id)
@@ -479,7 +538,10 @@ async def analyze(
             warnings.append(f"Node #{mid} has no arrow connections.")
 
         has_uncertain_edges = any(bool(e.get("uncertain")) or bool(e.get("unconfirmed_suggestion")) for e in connections)
-        has_needs_review_nodes = any(n.get("data", {}).get("needs_review") for n in react_nodes)
+        has_needs_review_nodes = any(
+            n.get("data", {}).get("needs_review") or n.get("data", {}).get("uncertain")
+            for n in react_nodes
+        )
         graph_status = "needs_review" if (has_uncertain_edges or has_needs_review_nodes or ocr_failed > 0 or missing_connections) else "verified"
 
         warning = " ".join(dict.fromkeys(warnings)) or None
@@ -547,7 +609,10 @@ async def generate_code(request_body: dict):
         # Check for unreadable / 'Needs review' nodes (Requirement 1)
         needs_review_nodes = [
             node for node in nodes
-            if (isinstance(node.get("data"), dict) and node["data"].get("needs_review"))
+            if (
+                isinstance(node.get("data"), dict)
+                and (node["data"].get("needs_review") or node["data"].get("uncertain"))
+            )
             or logic_engine.node_text(node).lower().startswith("needs review")
             or "needs review" in logic_engine.node_text(node).lower()
             or logic_engine.node_text(node).lower().startswith("unlabeled")
@@ -556,8 +621,8 @@ async def generate_code(request_body: dict):
         if needs_review_nodes:
             raise HTTPException(
                 422,
-                "Some imported flowchart labels could not be read and are marked 'Needs review'. "
-                "Please review and correct these nodes on the canvas before generating code.",
+                "Some imported flowchart labels are unreadable or low-confidence and are marked 'Needs review'. "
+                "Please correct and confirm these nodes on the canvas before generating code.",
             )
 
         # Check for unconfirmed suggested decision branches (Requirement 2)

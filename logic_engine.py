@@ -133,11 +133,15 @@ def sanitize_graph(nodes: list, edges: list) -> tuple[list, list]:
         pos = n.get("position") or {"x": 300, "y": 80}
         data = n.get("data") if isinstance(n.get("data"), dict) else {}
         label = node_text(n)
+        clean_data = {"label": label}
+        for key in ("needs_review", "uncertain", "confidence"):
+            if key in data:
+                clean_data[key] = data[key]
         clean_nodes.append({
             "id": nid,
             "type": ntype,
             "position": {"x": float(pos.get("x", 0)), "y": float(pos.get("y", 0))},
-            "data": {"label": label},
+            "data": clean_data,
             "text": label,
         })
 

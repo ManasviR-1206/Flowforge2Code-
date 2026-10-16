@@ -301,7 +301,9 @@ def detect_connections(thresh_img, blocks):
 
     def endpoint_ink(px: int, py: int) -> int:
         radius = params["endpoint_radius"]
-        crop = mask[max(0, py - radius):min(h, py + radius + 1), max(0, px - radius):min(w, px + radius + 1)]
+        # Use the original threshold around endpoints: the route mask clears
+        # bounding rectangles and can erase arrowheads that overlap a shape.
+        crop = thresh_img[max(0, py - radius):min(h, py + radius + 1), max(0, px - radius):min(w, px + radius + 1)]
         return int(np.count_nonzero(crop))
 
     if lines is not None:
@@ -435,10 +437,8 @@ def detect_connections(thresh_img, blocks):
                 t_block, s_block = target_ep["block"], source_ep["block"]
 
             diff = target_ep["ink"] - source_ep["ink"]
-            is_backward = s_block["center"][1] > t_block["center"][1]
-            is_uncertain = (diff < params["ink_diff_thresh"] and not is_backward)
-
             conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2))) if diff > 0 else 0.5
+            is_uncertain = conf < 0.6
             dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
             pair = tuple(sorted(dir_pair))
             routed_pairs.add(pair)
@@ -493,6 +493,13 @@ def detect_connections(thresh_img, blocks):
 
     if not connections:
         warnings.append("No directed arrows could be reconstructed confidently. Connect the detected nodes manually.")
+    else:
+        for connection in connections:
+            if connection.get("uncertain"):
+                warnings.append(
+                    f"Connection from shape #{connection['from']} to shape #{connection['to']} "
+                    "has uncertain arrow direction; review or reconnect it."
+                )
 
     connected_ids = {
         int(node_id)
@@ -523,8 +530,28 @@ def find_nearest_block(point, blocks, max_dist=120):
 def deduplicate_connections(connections):
     unique = []
     for c in connections:
-        # Avoid exact duplicate edges
-        if any(u["from"] == c["from"] and u["to"] == c["to"] for u in unique):
+        same_index = next(
+            (
+                i for i, edge in enumerate(unique)
+                if edge["from"] == c["from"] and edge["to"] == c["to"]
+            ),
+            None,
+        )
+        if same_index is not None:
+            existing = unique[same_index]
+            existing_confidence = float(existing.get("confidence", 0))
+            candidate_confidence = float(c.get("confidence", 0))
+            if (
+                candidate_confidence > existing_confidence
+                or (
+                    candidate_confidence == existing_confidence
+                    and not c.get("uncertain")
+                    and existing.get("uncertain")
+                )
+            ):
+                if not c.get("branch") and existing.get("branch"):
+                    c["branch"] = existing["branch"]
+                unique[same_index] = c
             continue
         # Check if reverse edge already exists on the same physical path
         rev = (c["to"], c["from"])

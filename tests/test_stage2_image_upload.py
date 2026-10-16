@@ -15,6 +15,7 @@ Validates:
 """
 
 import ast as py_ast
+import copy
 import io
 import os
 import pytest
@@ -127,6 +128,36 @@ def test_adaptive_thresholds_scaling():
     assert large["min_component_area"] > small["min_component_area"]
 
 
+def test_image_preprocessing_normalizes_color_and_caps_size():
+    """PIL RGB images become OpenCV BGR arrays and large images are scaled down."""
+    rgb = np.zeros((1600, 800, 3), dtype=np.uint8)
+    rgb[:] = (10, 20, 30)
+
+    normalized = cv_engine.normalize_image(Image.fromarray(rgb))
+
+    assert normalized.shape == (1280, 640, 3)
+    assert tuple(normalized[0, 0]) == (30, 20, 10)
+
+
+def test_ocr_keeps_low_confidence_operators_and_operands(monkeypatch):
+    """A low-confidence '*' and 'i' must not turn multiplication into a no-op."""
+    monkeypatch.setattr(
+        ocr_engine.pytesseract,
+        "image_to_data",
+        lambda *_args, **_kwargs: {
+            "text": ["fact", "=", "fact", "*", "i"],
+            "conf": ["95", "95", "95", "15", "20"],
+        },
+    )
+
+    text, confidence = ocr_engine._read_candidate(
+        np.zeros((10, 10), dtype=np.uint8)
+    )
+
+    assert text == "fact = fact * i"
+    assert confidence == 64
+
+
 def test_synthetic_factorial_symbol_detection():
     """Verify that all 9 symbols in the factorial flowchart are detected accurately."""
     bgr = build_synthetic_factorial_image()
@@ -231,6 +262,97 @@ def test_factorial_loopback_and_branch_reconstruction():
     incoming_to_dec = [e for e in edges if e["target"] == dec_id]
     # One incoming from initial setup (i = 1), one loop-back from bottom (i = i + 1)
     assert len(incoming_to_dec) >= 2, f"Expected at least 2 incoming edges to decision, got {len(incoming_to_dec)}"
+
+
+def test_uploaded_factorial_image_reconstructs_and_generates_code(monkeypatch):
+    """Exercise preprocessing, OCR, shape association, connectors, and Python execution."""
+    monkeypatch.setattr(api_server, "GEMINI_API_KEY", "")
+    image = build_synthetic_factorial_image()
+    _, encoded = cv2.imencode(".png", image)
+
+    analyzed = client.post(
+        "/api/analyze",
+        files={"file": ("factorial.png", encoded.tobytes(), "image/png")},
+    )
+    assert analyzed.status_code == 200, analyzed.text
+    graph = analyzed.json()
+
+    expected_labels = {
+        "1": "Start",
+        "2": "Input n",
+        "3": "fact = 1",
+        "4": "i = 1",
+        "5": "i <= n",
+        "6": "Print fact",
+        "7": "End",
+        "8": "fact = fact * i",
+    }
+    labels = {node["id"]: node["data"]["label"] for node in graph["nodes"]}
+    assert len(labels) == 9
+    assert {node_id: labels[node_id] for node_id in expected_labels} == expected_labels
+    assert labels["9"].startswith("i = i +")
+    assert graph["graph_status"] == "needs_review"
+    review_ids = {
+        node["id"] for node in graph["nodes"] if node["data"]["needs_review"]
+    }
+    assert {"8", "9"} <= review_ids
+
+    edge_map = {
+        (edge["source"], edge["target"]): edge
+        for edge in graph["edges"]
+    }
+    assert set(edge_map) == {
+        ("1", "2"), ("2", "3"), ("3", "4"), ("4", "5"),
+        ("5", "6"), ("5", "8"), ("6", "7"), ("8", "9"), ("9", "5"),
+    }
+    assert edge_map[("5", "6")]["label"] == "No"
+    assert edge_map[("5", "8")]["label"] == "Yes"
+    assert edge_map[("9", "5")]["data"]["uncertain"] is True
+
+    pending_review = client.post(
+        "/api/generate-code",
+        json={"nodes": graph["nodes"], "edges": graph["edges"]},
+    )
+    assert pending_review.status_code == 422
+    assert "review" in pending_review.json()["detail"].lower()
+
+    corrected = copy.deepcopy({"nodes": graph["nodes"], "edges": graph["edges"]})
+    corrected_labels = {**expected_labels, "9": "i = i + 1"}
+    for node in corrected["nodes"]:
+        node["data"]["label"] = corrected_labels[node["id"]]
+        node["data"]["needs_review"] = False
+        node["data"]["uncertain"] = False
+    for edge in corrected["edges"]:
+        edge["data"]["uncertain"] = False
+        edge["data"]["unconfirmed_suggestion"] = False
+
+    generated = client.post("/api/generate-code", json=corrected)
+    assert generated.status_code == 200, generated.text
+    code = generated.json()["code"]
+    assert py_ast.parse(code)
+    assert "fact = fact * i" in code
+    assert "i = i + 1" in code
+    assert "while i <= n:" in code
+
+    generated_again = client.post("/api/generate-code", json=corrected)
+    assert generated_again.status_code == 200, generated_again.text
+    assert generated_again.json()["code"] == code
+
+    old_mode = os.environ.get("FLOWFORGE_EXECUTION")
+    try:
+        os.environ["FLOWFORGE_EXECUTION"] = "local-dev"
+        executed = client.post(
+            "/api/execute",
+            json={"code": code, "user_input": "5\n"},
+        )
+        assert executed.status_code == 200, executed.text
+        assert executed.json()["success"] is True
+        assert "120" in executed.json()["output"]
+    finally:
+        if old_mode is None:
+            os.environ.pop("FLOWFORGE_EXECUTION", None)
+        else:
+            os.environ["FLOWFORGE_EXECUTION"] = old_mode
 
 
 def test_needs_review_on_unread_nodes():

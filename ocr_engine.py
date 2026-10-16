@@ -44,10 +44,10 @@ def tesseract_available():
     return _tesseract_available
 
 
-def _read_candidate(image):
+def _read_candidate(image, config="--oem 3 --psm 6"):
     data = pytesseract.image_to_data(
         image,
-        config="--oem 3 --psm 6",
+        config=config,
         output_type=pytesseract.Output.DICT,
     )
     words = [
@@ -55,50 +55,113 @@ def _read_candidate(image):
         for text, confidence in zip(data["text"], data["conf"])
         if text.strip()
     ]
-    confident_words = [(text, confidence) for text, confidence in words if confidence >= 50]
-    selected_words = confident_words or words
-    if not selected_words:
+    if not words:
         return "", -1
-    text = " ".join(word for word, _ in selected_words)
-    confidence = sum(score for _, score in selected_words) / len(selected_words)
+    text = " ".join(word for word, _ in words)
+    confidence = sum(score for _, score in words) / len(words)
     return text, confidence
 
 
 def extract_block_text(img, bbox):
+    """Return recognized text for a detected flowchart shape."""
+    text, _ = extract_block_text_with_confidence(img, bbox)
+    return text
+
+
+def extract_block_text_with_confidence(img, bbox):
     """
-    Crops ROI bounding box, expands padding, applies bilateral filtering,
-    and extracts text using Tesseract OCR.
-    Never invents executable labels when recognition fails.
+    Read a detected shape with multiple OCR layouts and a thresholded fallback.
+    Low-confidence text is returned for review rather than silently shortened.
     """
     x, y, w, h = bbox
     img_h, img_w = img.shape[:2]
 
-    pad = 6
+    pad = max(6, int(round(min(w, h) * 0.12)))
     x1, y1 = max(0, x - pad), max(0, y - pad)
     x2, y2 = min(img_w, x + w + pad), min(img_h, y + h + pad)
 
     roi = img[y1:y2, x1:x2]
     if roi.size == 0:
-        return ""
+        return "", -1
 
     if not tesseract_available():
-        return ""
+        return "", -1
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     candidates = []
     full_size = cv2.resize(gray, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    candidates.append(_read_candidate(full_size))
+    candidates.append(_read_candidate(full_size, "--oem 3 --psm 6"))
 
     height, width = gray.shape[:2]
     inner = gray[int(height * 0.2):int(height * 0.8), int(width * 0.16):int(width * 0.84)]
     if inner.size:
         inner_size = cv2.resize(inner, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-        candidates.append(_read_candidate(inner_size))
+        candidates.append(_read_candidate(inner_size, "--oem 3 --psm 6"))
 
-    text, conf = max(candidates, key=lambda candidate: candidate[1])
-    if conf < 30 or not re.search(r'[A-Za-z0-9]', text):
-        return ""
-    return clean_ocr_text(text)
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    adaptive_size = cv2.resize(
+        adaptive, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+    )
+    candidates.append(_read_candidate(adaptive_size, "--oem 3 --psm 11"))
+
+    shape_x1 = min(img_w, x + int(w * 0.12))
+    shape_y1 = min(img_h, y + int(h * 0.2))
+    shape_x2 = max(shape_x1, min(img_w, x + int(w * 0.88)))
+    shape_y2 = max(shape_y1, min(img_h, y + int(h * 0.8)))
+    shape_inner = img[shape_y1:shape_y2, shape_x1:shape_x2]
+    if shape_inner.size:
+        shape_gray = cv2.cvtColor(shape_inner, cv2.COLOR_BGR2GRAY)
+        shape_gray_size = cv2.resize(
+            shape_gray, (0, 0), fx=3.0, fy=3.0,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        candidates.append(_read_candidate(shape_gray_size, "--oem 3 --psm 6"))
+        if min(shape_gray.shape[:2]) >= 11:
+            shape_adaptive = cv2.adaptiveThreshold(
+                shape_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2,
+            )
+            shape_size = cv2.resize(
+                shape_adaptive, (0, 0), fx=3.0, fy=3.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            candidates.append(_read_candidate(shape_size, "--oem 3 --psm 11"))
+
+    def candidate_rank(candidate):
+        raw_text, confidence = candidate
+        cleaned = clean_ocr_text(raw_text)
+        rank = confidence
+        if re.search(r"\b(?:input|print|start|end)\b", cleaned, re.I):
+            rank += 18
+        if re.search(r"\b[A-Za-z_]\w*\s*=\s*[^=].+", cleaned):
+            rank += 18
+        if re.search(r"(?:<=|>=|==|!=|[<>])", cleaned):
+            rank += 12
+        if len(re.findall(r"[A-Za-z0-9]", cleaned)) >= 3:
+            rank += 6
+        return rank
+
+    text, confidence = max(candidates, key=candidate_rank)
+    cleaned = clean_ocr_text(text)
+    if confidence < 15 or not re.search(r"[A-Za-z0-9]", cleaned):
+        return "", confidence
+    plausible_candidates = set()
+    for candidate_text, candidate_confidence in candidates:
+        candidate_cleaned = clean_ocr_text(candidate_text)
+        if candidate_confidence < 30 or re.search(r"[^A-Za-z0-9_+\-*/%=<>?! .]", candidate_cleaned):
+            continue
+        if not re.search(r"\b[A-Za-z_]\w*\s*=", candidate_cleaned) and not re.search(
+            r"(?:<=|>=|==|!=|[<>])", candidate_cleaned
+        ) and not re.search(r"\b(?:input|print|start|end)\b", candidate_cleaned, re.I):
+            continue
+        plausible_candidates.add(
+            re.sub(r"[^a-z0-9_+\-*/%=<>?!]", "", candidate_cleaned.lower())
+        )
+    if len(plausible_candidates) > 1:
+        confidence = min(confidence, 49)
+    return cleaned, confidence
 
 
 def extract_region_text(img, bbox):
@@ -273,4 +336,3 @@ def extract_flowchart_text_with_gemini(
 
 
 init_tesseract()
-
