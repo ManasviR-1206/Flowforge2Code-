@@ -119,7 +119,7 @@ def classify_semantic(shape: str, text: str) -> str:
 
 
 def _looks_like_condition(text: str) -> bool:
-    return bool(re.search(r"(>=|<=|==|!=|>|<|%|\b(and|or|not)\b)", text, re.I))
+    return bool(re.search(r"(>=|<=|==|!=|>|<|%|≤|≥|≠|\b(and|or|not)\b)", text, re.I))
 
 
 def sanitize_graph(nodes: list, edges: list) -> tuple[list, list]:
@@ -350,6 +350,29 @@ def extract_input_var(text: str) -> str:
     return ids[0]
 
 
+def extract_input_vars(text: str) -> list[str]:
+    """All variable names defined by an input node.
+
+    Handles a single input ('Input n' -> ['n']) and a list packed into one shape
+    ('Input A, B, C' -> ['A', 'B', 'C']), so every listed variable is initialized.
+    """
+    clean = re.sub(r"^(input|read|get|enter)\s*", "", text, flags=re.I).strip()
+    clean = clean.strip("\"'")
+    parts = [p.strip() for p in re.split(r",|\band\b", clean) if p.strip()]
+    if len(parts) <= 1:
+        return [extract_input_var(text)]
+    names = []
+    for part in parts:
+        ids = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", part)
+        if not ids:
+            continue
+        if len(ids) > 1 and ids[0].lower() in INPUT_TYPE_WORDS:
+            names.append(ids[-1])
+        else:
+            names.append(ids[0])
+    return names or [extract_input_var(text)]
+
+
 def extract_print_value(text: str) -> str:
     clean = re.sub(r"^(print|output|display|show|write)\s*", "", text, flags=re.I).strip()
     if not clean:
@@ -374,9 +397,12 @@ def json_quote(s: str) -> str:
 
 
 def normalize_condition(text: str) -> str:
-    cond = text.replace("?", "").strip()
+    # A condition wrapped across several OCR lines is still one Boolean
+    # expression; join the lines so it parses as valid Python.
+    cond = re.sub(r"\s*\n+\s*", " ", text.replace("?", "")).strip()
     if not cond or cond.lower() in GENERIC_LABELS:
         raise ValueError("Decision node needs an explicit condition before code can be generated.")
+    cond = cond.replace("≤", "<=").replace("≥", ">=").replace("≠", "!=")
     cond = re.sub(r"^(if|whether|check( if)?)\s+", "", cond, flags=re.I).strip()
 
     replacements = {
@@ -392,6 +418,9 @@ def normalize_condition(text: str) -> str:
         "mod": "%",
         " is even": " % 2 == 0",
         " is odd": " % 2 != 0",
+        "≤": "<=",
+        "≥": ">=",
+        "≠": "!=",
     }
     low = cond.lower()
     for k, v in replacements.items():
@@ -458,14 +487,16 @@ def compile_to_python(ast_data: dict) -> str:
         if ntype in ("start", "end", "connector", "offpage", "arrow"):
             return
         if ntype == "input":
-            var_name = extract_input_var(text)
+            var_names = extract_input_vars(text)
             text_low = text.lower()
             if any(k in text_low for k in ("op", "operation", "str", "string", "name", "char", "choice", "text", "line", "symbol", "sign", "mode")):
-                lines.append(f'{indent}{var_name} = input("Enter {var_name}: ")')
+                template = '{0} = input("Enter {0}: ")'
             elif any(k in text_low for k in ("float", "price", "rate", "avg", "average", "double")):
-                lines.append(f'{indent}{var_name} = float(input("Enter {var_name}: "))')
+                template = '{0} = float(input("Enter {0}: "))'
             else:
-                lines.append(f'{indent}{var_name} = int(input("Enter {var_name}: "))')
+                template = '{0} = int(input("Enter {0}: "))'
+            for var_name in var_names:
+                lines.append(indent + template.format(var_name))
             return
         if ntype == "output":
             lines.append(f"{indent}print({extract_print_value(text)})")
@@ -476,14 +507,18 @@ def compile_to_python(ast_data: dict) -> str:
             return
         if ntype == "decision":
             return
-        if "=" in text or "+=" in text or "-=" in text or "*=" in text or "/=" in text:
-            lines.append(f"{indent}{text}")
-        elif text and text.lower() not in GENERIC_LABELS:
-            # Treat bare expressions as statements when they look like code
-            if re.search(r"[+\-*/%]", text) and re.search(r"[A-Za-z_]", text):
-                lines.append(f"{indent}{text}")
-            else:
-                lines.append(f"{indent}# {text}")
+        stmts = [s.strip() for s in text.replace(";", "\n").splitlines() if s.strip()]
+        for stmt in stmts:
+            stmt = stmt.replace("×", "*")
+            stmt = re.sub(r'(?<=\w)\s+[xX]\s+(?=\w)', ' * ', stmt)
+            if "=" in stmt or "+=" in stmt or "-=" in stmt or "*=" in stmt or "/=" in stmt:
+                lines.append(f"{indent}{stmt}")
+            elif stmt and stmt.lower() not in GENERIC_LABELS:
+                # Treat bare expressions as statements when they look like code
+                if re.search(r"[+\-*/%]", stmt) and re.search(r"[A-Za-z_]", stmt):
+                    lines.append(f"{indent}{stmt}")
+                else:
+                    lines.append(f"{indent}# {stmt}")
 
     def process_flow(nid: Optional[str], indent: str, stop_at: Optional[str], stack: tuple[str, ...]) -> None:
         while nid and nid in nodes and nid != stop_at:
@@ -721,8 +756,7 @@ def consistency_warnings(ast_data: dict, code: str) -> list[str]:
     input_vars = set()
     for node in ast_data.get("nodes", []):
         if node.get("type") == "input":
-            var_name = extract_input_var(str(node.get("raw_text") or ""))
-            input_vars.add(var_name)
+            input_vars.update(extract_input_vars(str(node.get("raw_text") or "")))
     undefined = _undefined_identifiers(code)
     if undefined:
         warnings.append(
@@ -736,8 +770,11 @@ def consistency_warnings(ast_data: dict, code: str) -> list[str]:
         if not text or text.lower() in GENERIC_LABELS:
             continue
         if ntype == "input":
-            var_name = extract_input_var(text)
-            if var_name and not re.search(rf"\b{re.escape(var_name)}\b", code):
+            missing = [
+                var_name for var_name in extract_input_vars(text)
+                if var_name and not re.search(rf"\b{re.escape(var_name)}\b", code)
+            ]
+            if missing:
                 warnings.append(f"Warning: The input node '{text}' is not represented correctly in the generated code.")
             elif "input(" not in code:
                 warnings.append("Warning: Flowchart input operations are missing from the generated code.")

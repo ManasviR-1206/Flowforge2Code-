@@ -180,6 +180,37 @@ NODE_TYPE_MAP = {
 }
 
 
+def _decision_condition_is_valid(text: str) -> bool:
+    """True when a decision label normalizes to a valid Python condition."""
+    try:
+        logic_engine.normalize_condition(text)
+        return True
+    except Exception:
+        return False
+
+
+_INPUT_VALUE_RE = re.compile(
+    r'^(print|input|output|display|show|write|read|get|enter)\s*', re.I
+)
+
+
+def _ai_reading_is_valid(block: dict, text: str) -> bool:
+    """Accept an AI OCR reading only when it is a structurally valid label.
+
+    An ambiguous label is cleared for review only if the recovered reading passes
+    the same per-type check the local path enforces: decision labels must compile
+    as a Python condition, and input/output shapes must carry a value (not just
+    the keyword).
+    """
+    shape_type = block.get("type", "process")
+    if shape_type == "decision":
+        return _decision_condition_is_valid(text)
+    if shape_type in ("input_output", "input", "output"):
+        value = _INPUT_VALUE_RE.sub("", text).strip().strip("\"'")
+        return bool(value)
+    return len(re.findall(r"[A-Za-z0-9]", text)) >= 2
+
+
 def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=None) -> list:
     nodes = []
     incoming = {str(connection["to"]) for connection in connections or []}
@@ -201,6 +232,18 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
                 needs_review = True
             else:
                 text = "Needs review: unread"
+                needs_review = True
+
+        # Flag input/output nodes where OCR read only the keyword with no value
+        # (e.g. "Print" without "Even", or "Input" without "n"). High OCR confidence
+        # on just the keyword means text_uncertain is False, but the node is incomplete
+        # and must be corrected before code generation.
+        if not needs_review and shape_type in ("input_output", "input", "output") and text:
+            _value_part = re.sub(
+                r'^(print|input|output|display|show|write|read|get|enter)\s*',
+                '', text, flags=re.I
+            ).strip().strip('"\'')
+            if not _value_part:
                 needs_review = True
 
         x = int((cx / max(img_width, 1)) * 550) + 50
@@ -364,6 +407,23 @@ async def analyze(
                 b["text"], b["text_confidence"] = ocr_engine.extract_block_text_with_confidence(
                     norm_img, b["bbox"]
                 )
+                # A decision condition whose comparison operators were misread
+                # (typically '≥'/'≤' collapsed to '=') is recovered from pixel
+                # evidence; the repair is only accepted when the recovered
+                # condition is valid Python, so nothing is approved blindly.
+                if b.get("type") == "decision" and b["text"]:
+                    bx, by, bw, bh = b["bbox"]
+                    roi = norm_img[by:by + bh, bx:bx + bw]
+                    repaired = ocr_engine.recover_condition_operators(b["text"], roi)
+                    if repaired != b["text"] and _decision_condition_is_valid(repaired):
+                        logger.info(
+                            "Recovered decision condition for shape #%s: %r -> %r",
+                            b["id"], b["text"], repaired,
+                        )
+                        b["text"] = repaired
+                        b["text_confidence"] = max(
+                            b["text_confidence"], float(OCR_REVIEW_CONFIDENCE + 10)
+                        )
                 b["text_uncertain"] = (
                     not b["text"] or b["text_confidence"] < OCR_REVIEW_CONFIDENCE
                 )
@@ -383,24 +443,102 @@ async def analyze(
                 ocr_uncertain += 1
                 logger.warning("OCR failed for detected shape #%s: %s", b["id"], e)
 
-        # Optional Gemini Vision OCR fallback if local OCR missed shapes and API key is present
-        if ocr_failed > 0 and GEMINI_API_KEY:
+        # Optional Gemini Vision fallback: fills shapes local OCR could not read and
+        # re-checks ambiguous labels (the local reading is passed as a hint). A
+        # returned reading is only accepted as confident when it passes the same
+        # structural validation the local path uses - gating is never bypassed.
+        if (ocr_failed > 0 or ocr_uncertain > 0) and GEMINI_API_KEY:
             try:
-                ai_texts = ocr_engine.extract_flowchart_text_with_gemini(pil_img, blocks, timeout_sec=6.0)
-                if ai_texts:
-                    for b in blocks:
-                        bid = int(b["id"])
-                        if not b.get("text") and bid in ai_texts and ai_texts[bid]:
-                            b["text"] = ai_texts[bid]
-                            b["text_uncertain"] = True
-                            ocr_failed = max(0, ocr_failed - 1)
-                            ocr_uncertain += 1
+                ai_texts = ocr_engine.extract_flowchart_text_with_gemini(
+                    pil_img, blocks, timeout_sec=6.0, include_uncertain=True
+                )
+                for b in blocks:
+                    bid = int(b["id"])
+                    ai_text = (ai_texts.get(bid) or "").strip()
+                    if not ai_text:
+                        continue
+                    if not b.get("text"):
+                        b["text"] = ai_text
+                        b["text_uncertain"] = True
+                        ocr_failed = max(0, ocr_failed - 1)
+                        ocr_uncertain += 1
+                    elif b.get("text_uncertain") and _ai_reading_is_valid(b, ai_text):
+                        logger.info(
+                            "Resolved ambiguous label for shape #%s via AI vision: %r -> %r",
+                            b["id"], b["text"], ai_text,
+                        )
+                        b["text"] = ai_text
+                        b["text_confidence"] = max(
+                            b["text_confidence"], float(OCR_REVIEW_CONFIDENCE + 10)
+                        )
+                        b["text_uncertain"] = False
+                        ocr_uncertain = max(0, ocr_uncertain - 1)
             except Exception as e:
                 connection_warnings.append(f"AI vision OCR fell back to local recognition: {e}")
 
         # Branch label recognition for decision diamonds
         if ocr_engine.tesseract_available():
             blocks_by_id = {int(block["id"]): block for block in blocks}
+            # 1. Broad surrounding OCR scan around each decision diamond
+            for block in blocks:
+                if block.get("type") != "decision":
+                    continue
+                bx, by, bw, bh = block["bbox"]
+                dcx, dcy = block["center"]
+                pad_x, pad_y = max(140, int(bw * 0.6)), max(90, int(bh * 0.5))
+                c_x1 = max(0, bx - pad_x)
+                c_y1 = max(0, by - pad_y)
+                c_x2 = min(w, bx + bw + pad_x)
+                c_y2 = min(h, by + bh + pad_y)
+                surround_crop = norm_img[c_y1:c_y2, c_x1:c_x2]
+                try:
+                    s_data = ocr_engine.pytesseract.image_to_data(
+                        surround_crop, config="--psm 11", output_type=ocr_engine.pytesseract.Output.DICT
+                    )
+                    texts = s_data.get("text", [])
+                    confs = s_data.get("conf", [])
+                    lefts = s_data.get("left", [])
+                    tops = s_data.get("top", [])
+                    widths = s_data.get("width", [])
+                    heights = s_data.get("height", [])
+                    dec_conns = [c for c in connections if int(c["from"]) == int(block["id"])]
+                    for i in range(len(texts)):
+                        w_text = str(texts[i]).strip()
+                        if not w_text:
+                            continue
+                        lbl = ocr_engine.clean_branch_label(w_text)
+                        if not lbl:
+                            continue
+                        w_conf = float(confs[i]) if i < len(confs) else 50.0
+                        if w_conf < 25:
+                            continue
+                        w_cx = c_x1 + lefts[i] + widths[i] // 2
+                        w_cy = c_y1 + tops[i] + heights[i] // 2
+                        best_conn = None
+                        min_d = float("inf")
+                        for conn in dec_conns:
+                            if conn.get("branch"):
+                                continue
+                            tb = blocks_by_id.get(int(conn["to"]))
+                            if not tb:
+                                continue
+                            tcx, tcy = tb["center"]
+                            same_side = (
+                                (w_cx < dcx and tcx < dcx)
+                                or (w_cx > dcx and tcx > dcx)
+                                or (w_cy > dcy and tcy > dcy and abs(w_cx - dcx) < bw * 0.4)
+                            )
+                            d = np.hypot(w_cx - tcx, w_cy - tcy)
+                            if same_side and d < min_d:
+                                min_d = d
+                                best_conn = conn
+                        if best_conn and not best_conn.get("branch"):
+                            best_conn["branch"] = lbl
+                            best_conn["confidence"] = max(float(best_conn.get("confidence", 0.5)), w_conf / 100.0)
+                            best_conn["uncertain"] = False
+                except Exception as ex:
+                    logger.debug("Decision surround OCR failed: %s", ex)
+
             for connection in connections:
                 start_block = blocks_by_id.get(int(connection["from"]))
                 end_block = blocks_by_id.get(int(connection["to"]))
@@ -422,10 +560,10 @@ async def analyze(
 
                 if tcx < cx:
                     lx, ly = bx, by + bh // 2
-                    points_to_check.extend([(lx - 45, ly - 30), (lx - 45, ly + 15), (lx - 30, ly - 35), (lx - 60, ly - 20)])
+                    points_to_check.extend([(lx - 45, ly - 30), (lx - 45, ly + 15), (lx - 30, ly - 35), (lx - 60, ly - 20), (lx - 90, ly - 30)])
                 if tcx > cx:
                     rx, ry = bx + bw, by + bh // 2
-                    points_to_check.extend([(rx + 45, ry - 30), (rx + 45, ry + 15), (rx + 30, ry - 35), (rx + 60, ry - 20)])
+                    points_to_check.extend([(rx + 45, ry - 30), (rx + 45, ry + 15), (rx + 30, ry - 35), (rx + 60, ry - 20), (rx + 90, ry - 30)])
                 if tcy > cy:
                     botx, boty = bx + bw // 2, by + bh
                     points_to_check.extend([(botx - 30, boty + 30), (botx + 30, boty + 30)])
@@ -445,8 +583,16 @@ async def analyze(
                 if branch_candidates:
                     chosen = max(branch_candidates, key=lambda c: c[1])[0]
                     connection["branch"] = chosen
+                    connection["uncertain"] = False
 
-        warnings = list(connection_warnings)
+        warnings = [
+            w for w in connection_warnings
+            if not any(
+                f"from shape #{c['from']} to shape #{c['to']}" in w
+                and not c.get("uncertain")
+                for c in connections
+            )
+        ]
 
         # Decision branches suggestion logic - Requirement 2:
         # "Do not silently infer Yes/No branches. You may suggest a complementary branch label,
@@ -486,6 +632,17 @@ async def analyze(
                     warnings.append(
                         f"Branch labels for decision #{decision_id} could not be detected; both connections are marked for review. "
                         "Please label the Yes and No branches."
+                    )
+                elif b1 == b2 and b1 in ("Yes", "No"):
+                    # Both branches have the same label (OCR misread, e.g. "No" read as "Yes").
+                    # Mark the second as uncertain and clear its label so the user can fix it.
+                    e2["branch"] = ""
+                    e2["uncertain"] = True
+                    e2["unconfirmed_suggestion"] = True
+                    e2["confidence"] = min(float(e2.get("confidence", 1)), 0.5)
+                    warnings.append(
+                        f"Decision #{decision_id}: both outgoing branches are labeled '{b1}'; "
+                        "the second branch is marked uncertain and needs a Yes/No label."
                     )
             elif len(decision_edges) < 2:
                 for edge in decision_edges:
@@ -534,9 +691,15 @@ async def analyze(
                 "Please review and edit those node labels on the canvas before generating code."
             )
         if ocr_uncertain and ocr_uncertain > ocr_failed:
+            uncertain_nodes = [
+                f"#{b['id']} ({b['text'].strip() or 'unread'})"
+                for b in blocks
+                if b.get("text_uncertain") and b.get("text")
+            ]
+            detail = ", ".join(uncertain_nodes) if uncertain_nodes else f"{ocr_uncertain - ocr_failed} shape(s)"
             warnings.append(
-                f"OCR confidence is low for {ocr_uncertain - ocr_failed} detected shape label(s). "
-                "Review and confirm those labels on the canvas before generating code."
+                f"These labels could not be confirmed automatically: {detail}. "
+                "Review and correct them on the canvas before generating code."
             )
 
         connected_ids = {
@@ -630,10 +793,15 @@ async def generate_code(request_body: dict):
             or not logic_engine.node_text(node).strip()
         ]
         if needs_review_nodes:
+            reviewable = []
+            for node in needs_review_nodes:
+                label = logic_engine.node_text(node).strip()
+                reviewable.append(f"#{node.get('id')} ({label or 'no label'})")
             raise HTTPException(
                 422,
                 "Some imported flowchart labels are unreadable or low-confidence and are marked 'Needs review'. "
-                "Please correct and confirm these nodes on the canvas before generating code.",
+                "Please correct and confirm these nodes on the canvas before generating code: "
+                + ", ".join(reviewable) + ".",
             )
 
         # Check for unconfirmed suggested decision branches (Requirement 2)
@@ -643,10 +811,14 @@ async def generate_code(request_body: dict):
             or edge.get("unconfirmed_suggestion")
         ]
         if unconfirmed_edges:
+            branch_list = ", ".join(
+                f"#{edge.get('source')}->#{edge.get('target')}" for edge in unconfirmed_edges
+            )
             raise HTTPException(
                 422,
                 "Some decision branches have suggested labels that require user confirmation. "
-                "Please review and confirm or edit the branch labels before generating code.",
+                "Please review and confirm or edit the branch labels before generating code: "
+                + branch_list + ".",
             )
 
         # Check for uncertain arrow connections (Requirement 5)
@@ -655,10 +827,14 @@ async def generate_code(request_body: dict):
             if isinstance(edge.get("data"), dict) and edge["data"].get("uncertain")
         ]
         if uncertain_edges:
+            edge_list = ", ".join(
+                f"#{edge.get('source')}->#{edge.get('target')}" for edge in uncertain_edges
+            )
             raise HTTPException(
                 422,
                 "Some imported connections have uncertain arrow direction. "
-                "Review or reconnect the dashed edges before generating Python.",
+                "Review or reconnect the dashed edges before generating Python: "
+                + edge_list + ".",
             )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
 

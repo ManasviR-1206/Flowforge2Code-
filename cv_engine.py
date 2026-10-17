@@ -63,7 +63,11 @@ def classify_shape(approx, cnt, aspect_ratio, circularity):
 
         if top_level and bottom_level and side_skew > max(3, 0.05 * w):
             return "input_output"
-        if max(abs(angle - 90) for angle in angles) <= 15 and 0.2 <= aspect_ratio <= 5.0:
+        # A rectangle (process box) has level top AND bottom edges. A diamond
+        # (rotated square) also has 90-degree corners, but its top-most vertex
+        # sits far below its side vertices, so top_level/bottom_level are False.
+        # Requiring level edges prevents diamonds being misread as process boxes.
+        if top_level and bottom_level and max(abs(angle - 90) for angle in angles) <= 15 and 0.2 <= aspect_ratio <= 5.0:
             return "process"
         side_ratio = max(side_lengths) / max(min(side_lengths), 1e-5)
         if side_ratio <= 1.3 and circularity < 0.85:
@@ -125,6 +129,30 @@ def get_adaptive_params(h: int, w: int) -> dict:
     }
 
 
+def contour_is_outline(cnt, ink_mask) -> bool:
+    """
+    Distinguishes a flowchart symbol outline (a ring enclosing mostly empty
+    fill) from a solid ink blob such as a cluster of text glyphs.
+
+    Text glyph clusters are filled shapes: almost all of the area inside their
+    contour is ink. A symbol outline (rectangle, diamond, ellipse, ...) encloses
+    mostly background. This lets the overlap filter avoid mistaking a shape's own
+    label text for an embedded symbol inside it.
+    """
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    if bw <= 0 or bh <= 0:
+        return False
+    sub_fill = np.zeros((bh, bw), np.uint8)
+    cv2.drawContours(sub_fill, [cnt - (x, y)], -1, 255, -1)
+    fill_area = int(np.count_nonzero(sub_fill))
+    if fill_area <= 0:
+        return False
+    sub_ink = ink_mask[y:y + bh, x:x + bw]
+    ink_inside = int(np.count_nonzero(cv2.bitwise_and(sub_ink, sub_fill)))
+    background_ratio = (fill_area - ink_inside) / fill_area
+    return background_ratio > 0.4
+
+
 def detect_symbols(img):
     """
     Detects symbols from a preprocessed image array using adaptive
@@ -182,7 +210,8 @@ def detect_symbols(img):
                 "type": shape_type,
                 "bbox": (x, y, bw, bh),
                 "center": (x + bw // 2, y + bh // 2),
-                "area": area
+                "area": area,
+                "outline": contour_is_outline(cnt, closed),
             })
             block_id += 1
 
@@ -235,6 +264,10 @@ def filter_overlapping_blocks(blocks):
             and candidate["area"] < block["area"]
             and candidate["bbox"][2] * candidate["bbox"][3] >= bbox_area * 0.02
             and candidate["area"] >= block["area"] * 0.05
+            # Only real symbol outlines count as embedded symbols. A shape's own
+            # text label is a solid glyph blob, not a nested symbol, so it must
+            # not cause the enclosing shape to be discarded as an aggregate.
+            and candidate.get("outline", True)
         ]
         distinct = []
         for candidate in nested:
@@ -444,8 +477,20 @@ def detect_connections(thresh_img, blocks):
                 t_block, s_block = target_ep["block"], source_ep["block"]
 
             diff = target_ep["ink"] - source_ep["ink"]
-            conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2))) if diff > 0 else 0.5
-            is_uncertain = conf < 0.6
+            is_terminal_end = (
+                t_block.get("type") == "start_end" and t_block["center"][1] > s_block["center"][1]
+            )
+            if is_terminal_end and diff >= params["ink_diff_thresh"]:
+                conf = 0.85
+                is_uncertain = False
+            elif diff >= params["ink_diff_thresh"]:
+                # Clear arrowhead ink difference at the target end: the arrow direction is reliable,
+                # even for non-terminal blocks (e.g. decision diamonds, process boxes).
+                conf = 0.8
+                is_uncertain = False
+            else:
+                conf = max(0.4, min(1.0, round(diff / max(1, target_ep["ink"]), 2))) if diff > 0 else 0.5
+                is_uncertain = conf < 0.6
             dir_pair = (int(source_ep["block"]["id"]), int(target_ep["block"]["id"]))
             pair = tuple(sorted(dir_pair))
             routed_pairs.add(pair)
