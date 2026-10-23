@@ -1,20 +1,57 @@
-﻿.git
+﻿# Version control and local editor state
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and caches
 .venv/
 .venv-*/
 venv/
 ENV/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+*.egg-info/
+
+# Node / frontend build output (rebuilt inside the image)
 node_modules/
 landing/node_modules/
 landing/dist/
-__pycache__/
-*.pyc
-.pytest_cache/
-.coverage
-htmlcov/
-scratch/
-.env
-.env.*
-!.env.example
+landing/.vite/
+npm-debug.log*
+yarn-error.log*
+
+# Local databases and runtime artifacts
 *.db
 *.sqlite
 *.sqlite3
+flowforge.db
+
+# Scratch, debug and backup artifacts (kept locally, never in the build context)
+scratch/
+scratch_*/
+*.log
+*.tmp
+*.bak
+Dockerfile.backup
+reviewing-stage1-security-patch-status.json
+
+# Deployment metadata that the image does not need
+docker-compose.yml
+render.yaml
+README.md

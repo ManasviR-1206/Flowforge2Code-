@@ -48,9 +48,32 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="FlowForge AI API", version="3.0.0", lifespan=lifespan)
 
+def _cors_origins() -> list[str]:
+    """Approved browser origins for cross-origin API calls.
+
+    Set FLOWFORGE_ALLOWED_ORIGINS to a comma-separated allowlist in production
+    (for example "https://flowforge.onrender.com"). When the frontend is served by
+    this same FastAPI app no CORS entry is needed at all, because requests are
+    same-origin. If the variable is unset we fall back to the local Vite
+    dev/preview origins so local development keeps working.
+    """
+    raw = os.getenv("FLOWFORGE_ALLOWED_ORIGINS", "").strip()
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    else:
+        origins = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:4173",
+            "http://127.0.0.1:4173",
+        ]
+    # A wildcard can never be combined with credentials; refuse it outright.
+    return [o for o in origins if o != "*"]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

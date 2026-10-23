@@ -51,6 +51,14 @@ from typing import Any, Optional
 
 log = logging.getLogger("flowforge.executor")
 
+# Remote runner client: used when the local bubblewrap sandbox cannot run on
+# this host (e.g. Render containers that block unprivileged user namespaces).
+# runner_client imports nothing from executor, so no circular dependency.
+try:
+    from runner_client import run_remote as _run_remote
+except ImportError:  # pragma: no cover - runner_client ships with the image
+    _run_remote = None
+
 MODES = ("auto", "sandbox", "local-dev", "off")
 DEFAULT_MODE = "auto"
 
@@ -769,19 +777,42 @@ def _acquire_slot() -> Optional[threading.BoundedSemaphore]:
     return sem if sem.acquire(blocking=False) else None
 
 
+def _exec_result_from_remote(remote: dict, mode: str) -> ExecResult:
+    """Convert a remote runner response dict into an ExecResult."""
+    return ExecResult(
+        status=remote.get("status", "error"),
+        stdout=remote.get("stdout", ""),
+        stderr=remote.get("stderr", ""),
+        exit_code=remote.get("exit_code"),
+        timed_out=remote.get("timed_out", False),
+        truncated=remote.get("truncated", False),
+        leaked_processes=remote.get("leaked_processes", False),
+        mode="remote",
+        message=remote.get("message", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
 def execute(code: Any, user_input: Any = "", timeout_sec: Optional[float] = None,
             client_is_local: bool = True) -> ExecResult:
     """Validate, apply policy, and run `code`. Never raises for bad input."""
     status = execution_status(block=True)
     mode = status["mode"]
-    if not status["enabled"]:
-        return ExecResult(status="disabled", mode=mode, message=status["reason"])
+
+    # local-dev is explicitly unsafe: only allow from the same machine
     if mode == "local-dev" and not client_is_local:
         return ExecResult(
             status="disabled", mode=mode,
             message="Code execution is disabled: the unsafe local-dev mode only accepts requests "
                     "made from the same machine.")
 
+    # `off` always disables execution, even if a remote runner is configured.
+    if not status["enabled"] and mode == "off":
+        return ExecResult(status="disabled", mode=mode, message=status["reason"])
+
+    # ---- Policy checks (apply to local AND remote execution) ----
     lim = get_limits()
     code = "" if code is None else str(code)
     user_input = "" if user_input is None else str(user_input)
@@ -806,7 +837,20 @@ def execute(code: Any, user_input: Any = "", timeout_sec: Optional[float] = None
         return ExecResult(status="busy", mode=mode,
                           message="The server is busy running other programs. Try again in a moment.")
     try:
-        return _run_program(code, user_input, lim, timeout, sandboxed=(mode != "local-dev"))
+        # ---- Decide where to run ----
+        if mode == "local-dev":
+            # Explicitly unsafe local subprocess (same-machine only, checked above).
+            return _run_program(code, user_input, lim, timeout, sandboxed=False)
+        if status["enabled"]:
+            # auto/sandbox: local bubblewrap sandbox passed its self-test.
+            return _run_program(code, user_input, lim, timeout, sandboxed=True)
+        # auto/sandbox: local sandbox unavailable. Fail over to the remote runner
+        # if one is configured; otherwise fail closed.
+        if _run_remote is not None:
+            remote = _run_remote(code, user_input, timeout)
+            if remote is not None:
+                return _exec_result_from_remote(remote, mode)
+        return ExecResult(status="disabled", mode=mode, message=status["reason"])
     finally:
         sem.release()
 
