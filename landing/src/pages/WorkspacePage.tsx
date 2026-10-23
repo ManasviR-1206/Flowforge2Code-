@@ -16,6 +16,7 @@ import { toPng } from 'html-to-image';
 import { nodeTypes } from '../flowchart/FlowNodes';
 import { SYMBOLS } from '../flowchart/symbols';
 import { apiJson, apiUrl, graphPayload } from '../flowchart/api';
+import { pyodideExecutor, browserResultToServerShape } from '../pyodide-executor';
 
 const edgeLook = (label?: string) => {
   const color = label === 'Yes' ? '#34d399' : label === 'No' ? '#f87171' : '#94a3b8';
@@ -158,6 +159,7 @@ export const WorkspacePage: React.FC = () => {
   const [execStatus, setExecStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [execProgramOutput, setExecProgramOutput] = useState('');
   const [execErrorDetails, setExecErrorDetails] = useState('');
+  const [execMode, setExecMode] = useState<'server' | 'browser' | null>(null);
   const [loadingRun, setLoadingRun] = useState(false);
   const [debugIssues, setDebugIssues] = useState<any[]>([]);
   const [debugSummary, setDebugSummary] = useState('');
@@ -558,12 +560,16 @@ export const WorkspacePage: React.FC = () => {
     setExecStatus('idle');
     setExecProgramOutput('');
     setExecErrorDetails('');
+    setExecMode(null);
     setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+
+    // ---- 1. Try server-side execution first ----
     try {
       const data = await apiJson('/api/execute', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: generatedCode, user_input: userInput }),
       });
+      setExecMode('server');
       const status = data.status === 'error' ? 'error' : data.success ? 'success' : 'idle';
       const programOutput = typeof data.program_output === 'string' ? data.program_output : (typeof data.output === 'string' ? data.output : '');
       const errorDetails = typeof data.error_details === 'string' ? data.error_details : '';
@@ -571,14 +577,46 @@ export const WorkspacePage: React.FC = () => {
       setExecProgramOutput(programOutput);
       setExecErrorDetails(errorDetails);
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+      setLoadingRun(false);
+      return;
     } catch (e: any) {
+      const msg = e.message || 'Execution error';
+      // If the server reports execution disabled (sandbox unavailable on this
+      // host), fall back to client-side Pyodide execution in the browser.
+      if (msg.includes('disabled') || msg.includes('sandbox') || e.status === 403) {
+        await runInBrowser(generatedCode, userInput);
+        setLoadingRun(false);
+        return;
+      }
       setExecStatus('error');
       setExecProgramOutput('');
-      setExecErrorDetails(e.message || 'Execution error');
+      setExecErrorDetails(msg);
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+      setLoadingRun(false);
+      return;
     }
-    setLoadingRun(false);
   };
+
+  /** Run code client-side via Pyodide in a Web Worker. */
+  async function runInBrowser(code: string, userInput: string): Promise<void> {
+    setExecMode('browser');
+    try {
+      const result = await pyodideExecutor.run({
+        code,
+        userInput: userInput,
+        timeoutSec: 5,
+      });
+      const shaped = browserResultToServerShape(result);
+      setExecStatus(shaped.success ? 'success' : 'error');
+      setExecProgramOutput(shaped.program_output);
+      setExecErrorDetails(shaped.error_details);
+    } catch (err: any) {
+      setExecStatus('error');
+      setExecProgramOutput('');
+      setExecErrorDetails(err.message || 'Browser execution failed.');
+    }
+    setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+  }
 
   const handleDebug = async () => {
     setLoadingDebug(true);
@@ -1072,6 +1110,12 @@ export const WorkspacePage: React.FC = () => {
             </div>
             {runOpen && (
               <div className="p-3 space-y-3">
+                {execMode === 'browser' && loadingRun && (
+                  <div className="flex items-center gap-2 p-2 bg-amber-900/20 border border-amber-700/40 rounded-lg">
+                    <div className="w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-[10px] text-amber-300 font-semibold">Loading Pyodide runtime (first run may take 10–20s)…</span>
+                  </div>
+                )}
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] font-semibold text-slate-400">Program Input (one value per line)</label>
                   <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-start">
@@ -1098,6 +1142,11 @@ export const WorkspacePage: React.FC = () => {
                     <span className={`text-[10px] font-bold ${execStatus === 'success' ? 'text-green-400' : execStatus === 'error' ? 'text-red-400' : 'text-slate-500'}`}>
                       {execStatus === 'success' ? 'Success' : execStatus === 'error' ? 'Error' : 'Idle'}
                     </span>
+                    {execMode && (
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${execMode === 'browser' ? 'bg-amber-900/40 text-amber-300 border border-amber-600/40' : 'bg-cyan-900/40 text-cyan-300 border border-cyan-600/40'}`}>
+                        {execMode === 'browser' ? 'Browser (Pyodide)' : 'Server'}
+                      </span>
+                    )}
                   </div>
 
                   <div className="space-y-1">

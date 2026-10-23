@@ -11,5 +11,18 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+    // Content Security Policy for the dev server.  Allows Pyodide (loaded from
+    // a pinned CDN) and blob-based Web Workers while keeping everything else
+    // same-origin.
+    headers: {
+      'Content-Security-Policy':
+        "default-src 'self'; " +
+        "script-src 'self' https://cdn.jsdelivr.net; " +
+        "worker-src 'self' blob:; " +
+        "connect-src 'self' https://cdn.jsdelivr.net; " +
+        "style-src 'self' 'unsafe-inline'; " +
+        "img-src 'self' data:; " +
+        "font-src 'self';",
+    },
   },
 })
