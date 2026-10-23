@@ -1,0 +1,57 @@
+# Render Blueprint for FlowForge2Code: API service + isolated runner service.
+#
+# Two Docker services are deployed from the same image:
+#   - flowforge-api:  FastAPI backend + SPA frontend, serves /api and landing/dist
+#   - flowforge-runner: isolated bubblewrap sandbox for executing untrusted Python
+#
+# The API falls back to the runner when the local host cannot support unprivileged
+# user namespaces (e.g. Render containers). Execution never degrades to
+# unrestricted local-dev mode in production.
+#
+# Configure in the Render dashboard (never commit real values):
+#   FLOWFORGE_RUNNER_TOKEN   - shared secret between API and runner
+#   GEMINI_API_KEY           - optional, for Gemini AI features
+#   FLOWFORGE_ALLOWED_ORIGINS - e.g. https://flowforge2-code.vercel.app
+services:
+  - type: web
+    name: flowforge-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: FLOWFORGE_SERVICE
+        value: api
+      - key: FLOWFORGE_EXECUTION
+        value: auto
+      # Runner endpoint. Set to the runner service's public URL after it is deployed.
+      - key: FLOWFORGE_RUNNER_URL
+        sync: false
+      # Shared secret with the runner service. Must match flowforge-runner below.
+      - key: FLOWFORGE_RUNNER_TOKEN
+        sync: false
+      - key: FLOWFORGE_ALLOWED_ORIGINS
+        sync: false
+      - key: FLOWFORGE_MAX_CONCURRENT_EXECUTIONS
+        value: "4"
+      - key: GEMINI_API_KEY
+        sync: false
+
+  - type: web
+    name: flowforge-runner
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: FLOWFORGE_SERVICE
+        value: runner
+      - key: FLOWFORGE_EXECUTION
+        value: sandbox
+      # Shared secret with the API service. Must match flowforge-api above.
+      - key: FLOWFORGE_RUNNER_TOKEN
+        sync: false

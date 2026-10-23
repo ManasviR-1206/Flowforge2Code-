@@ -16,6 +16,7 @@ import { toPng } from 'html-to-image';
 import { nodeTypes } from '../flowchart/FlowNodes';
 import { SYMBOLS } from '../flowchart/symbols';
 import { apiJson, apiUrl, graphPayload } from '../flowchart/api';
+import { pyodideExecutor, browserResultToServerShape } from '../pyodide-executor';
 
 const edgeLook = (label?: string) => {
   const color = label === 'Yes' ? '#34d399' : label === 'No' ? '#f87171' : '#94a3b8';
@@ -158,6 +159,7 @@ export const WorkspacePage: React.FC = () => {
   const [execStatus, setExecStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [execProgramOutput, setExecProgramOutput] = useState('');
   const [execErrorDetails, setExecErrorDetails] = useState('');
+  const [execMode, setExecMode] = useState<'server' | 'browser' | null>(null);
   const [loadingRun, setLoadingRun] = useState(false);
   const [debugIssues, setDebugIssues] = useState<any[]>([]);
   const [debugSummary, setDebugSummary] = useState('');
@@ -176,6 +178,7 @@ export const WorkspacePage: React.FC = () => {
   const [loadingUpload, setLoadingUpload] = useState(false);
   const [uploadOverlay, setUploadOverlay] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState('');
+  const [uploadWarnings, setUploadWarnings] = useState<string[]>([]);
   const [aiPrompt, setAiPrompt] = useState('');
   const [loadingAiFlow, setLoadingAiFlow] = useState(false);
   const [aiError, setAiError] = useState('');
@@ -229,7 +232,10 @@ export const WorkspacePage: React.FC = () => {
   }, [nodes.length]);
 
   const addLabelChange = useCallback((nid: string, newLabel: string) => {
-    setNodes(prev => prev.map(n => n.id === nid ? { ...n, data: { ...n.data, label: newLabel } } : n));
+    setNodes(prev => prev.map(n => n.id === nid ? {
+      ...n,
+      data: { ...n.data, label: newLabel, needs_review: false, uncertain: false },
+    } : n));
     setFitRevision(revision => revision + 1);
   }, []);
 
@@ -270,6 +276,7 @@ export const WorkspacePage: React.FC = () => {
       ...e,
       label,
       sourceHandle: handle,
+      data: { ...e.data, uncertain: false, unconfirmed_suggestion: false },
       ...edgeLook(label),
     } : e));
   };
@@ -383,6 +390,10 @@ export const WorkspacePage: React.FC = () => {
     if (!patch) return;
     if (patch.action === 'replace' && patch.nodes) {
       loadFlowchart(patch.nodes, patch.edges || []);
+      // Hand back exactly what was just placed on the canvas. React state has not
+      // re-rendered yet, so callers that need to act on the new graph (e.g. code
+      // generation) must use these arrays instead of the stale nodes/edges state.
+      return { nodes: patch.nodes as Node[], edges: (patch.edges || []) as Edge[] };
     } else if ((patch.action === 'add_nodes' || patch.action === 'add') && (patch.new_nodes || patch.nodes)) {
       snapshot();
       const extra = (patch.new_nodes || patch.nodes || []).map((n: Node) => ({ ...n, data: { ...n.data, onLabelChange: addLabelChange } }));
@@ -397,6 +408,7 @@ export const WorkspacePage: React.FC = () => {
   const handleFileChange = (f: File | null) => {
     setUploadFile(f);
     setUploadError('');
+    setUploadWarnings([]);
     setUploadOverlay(null);
     if (f) setUploadPreview(URL.createObjectURL(f));
   };
@@ -404,6 +416,7 @@ export const WorkspacePage: React.FC = () => {
   const handleAnalyzeImage = async (useSample = false) => {
     setLoadingUpload(true);
     setUploadError('');
+    setUploadWarnings([]);
     try {
       const fd = new FormData();
       fd.append('mode', useSample ? 'sample' : 'upload');
@@ -425,10 +438,24 @@ export const WorkspacePage: React.FC = () => {
         throw new Error(message);
       }
       setUploadOverlay(data.overlay_image || null);
+      setUploadWarnings(Array.isArray(data.warnings) ? data.warnings : []);
+      setCodeWarnings(Array.isArray(data.warnings) ? data.warnings : []);
       if (data.nodes?.length) {
         loadFlowchart(data.nodes, data.edges || []);
         setMode('draw');
-        addAria(`Detected ${data.nodes.length} flowchart symbols and loaded them onto the canvas.${data.warning ? ' ' + data.warning : ''} You can edit labels, then generate Python.`);
+        const reviewCount = (data.nodes || []).filter((n: any) => n?.data?.needs_review).length;
+        const uncertainEdges = (data.edges || []).filter((e: any) => e?.data?.uncertain || e?.data?.unconfirmed_suggestion).length;
+        if (data.graph_status === 'verified' && !reviewCount && !uncertainEdges) {
+          // Confidence is sufficient: generate the Python automatically so the
+          // import-to-code workflow needs no extra click.
+          addAria(`Detected ${data.nodes.length} flowchart symbols and loaded them onto the canvas.${data.warning ? ' ' + data.warning : ''} The graph is verified — generating Python automatically.`);
+          void handleGenerateCode(data.nodes, data.edges || []);
+        } else {
+          const reviewMsg = reviewCount
+            ? ` ${reviewCount} node${reviewCount > 1 ? 's' : ''} need review — correct the amber-highlighted labels before generating code.`
+            : '';
+          addAria(`Detected ${data.nodes.length} flowchart symbols and loaded them onto the canvas.${data.warning ? ' ' + data.warning : ''}${reviewMsg} You can edit labels, then generate Python.`);
+        }
       } else {
         setUploadError('No flowchart symbols detected. Try a clearer PNG/JPG with distinct shapes.');
       }
@@ -458,8 +485,10 @@ export const WorkspacePage: React.FC = () => {
     setLoadingAiFlow(false);
   };
 
-  const handleGenerateCode = async () => {
-    if (!nodes.length) {
+  const handleGenerateCode = async (overrideNodes?: Node[], overrideEdges?: Edge[]) => {
+    const useNodes = overrideNodes ?? nodes;
+    const useEdges = overrideEdges ?? edges;
+    if (!useNodes.length) {
       setCodeWarnings(['Canvas is empty. Create a flowchart first.']);
       return;
     }
@@ -467,12 +496,16 @@ export const WorkspacePage: React.FC = () => {
     try {
       const data = await apiJson('/api/generate-code', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(graphPayload(nodes, edges)),
+        body: JSON.stringify(graphPayload(useNodes, useEdges)),
       });
       setGeneratedCode(data.code || '');
       setCodeWarnings(data.warnings || []);
     } catch (e: any) {
+      setGeneratedCode('');
       setCodeWarnings([e.message]);
+      // The validation error names the offending nodes/edges; make sure the
+      // panel that shows it is visible instead of leaving the user guessing.
+      setRightOpen(true);
     }
     setLoadingCode(false);
   };
@@ -527,12 +560,16 @@ export const WorkspacePage: React.FC = () => {
     setExecStatus('idle');
     setExecProgramOutput('');
     setExecErrorDetails('');
+    setExecMode(null);
     setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+
+    // ---- 1. Try server-side execution first ----
     try {
       const data = await apiJson('/api/execute', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: generatedCode, user_input: userInput }),
       });
+      setExecMode('server');
       const status = data.status === 'error' ? 'error' : data.success ? 'success' : 'idle';
       const programOutput = typeof data.program_output === 'string' ? data.program_output : (typeof data.output === 'string' ? data.output : '');
       const errorDetails = typeof data.error_details === 'string' ? data.error_details : '';
@@ -540,14 +577,46 @@ export const WorkspacePage: React.FC = () => {
       setExecProgramOutput(programOutput);
       setExecErrorDetails(errorDetails);
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+      setLoadingRun(false);
+      return;
     } catch (e: any) {
+      const msg = e.message || 'Execution error';
+      // If the server reports execution disabled (sandbox unavailable on this
+      // host), fall back to client-side Pyodide execution in the browser.
+      if (msg.includes('disabled') || msg.includes('sandbox') || e.status === 403) {
+        await runInBrowser(generatedCode, userInput);
+        setLoadingRun(false);
+        return;
+      }
       setExecStatus('error');
       setExecProgramOutput('');
-      setExecErrorDetails(e.message || 'Execution error');
+      setExecErrorDetails(msg);
       setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+      setLoadingRun(false);
+      return;
     }
-    setLoadingRun(false);
   };
+
+  /** Run code client-side via Pyodide in a Web Worker. */
+  async function runInBrowser(code: string, userInput: string): Promise<void> {
+    setExecMode('browser');
+    try {
+      const result = await pyodideExecutor.run({
+        code,
+        userInput: userInput,
+        timeoutSec: 5,
+      });
+      const shaped = browserResultToServerShape(result);
+      setExecStatus(shaped.success ? 'success' : 'error');
+      setExecProgramOutput(shaped.program_output);
+      setExecErrorDetails(shaped.error_details);
+    } catch (err: any) {
+      setExecStatus('error');
+      setExecProgramOutput('');
+      setExecErrorDetails(err.message || 'Browser execution failed.');
+    }
+    setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
+  }
 
   const handleDebug = async () => {
     setLoadingDebug(true);
@@ -606,7 +675,7 @@ export const WorkspacePage: React.FC = () => {
         body: JSON.stringify({ message: text, ...graphPayload(nodes, edges) }),
       });
       addAria(data.reply || '(No reply)', data.patch);
-      if (data.patch) applyPatch(data.patch);
+      const applied = data.patch ? applyPatch(data.patch) : undefined;
       if (data.trigger === 'fix_flowchart') await handleAutoFix();
       if (data.trigger === 'generate_code' || data.code) {
         if (data.code) {
@@ -615,6 +684,12 @@ export const WorkspacePage: React.FC = () => {
         } else {
           await handleGenerateCode();
         }
+      } else if (applied && applied.nodes.length) {
+        // ARIA just built or replaced the flowchart on the canvas. Run the existing
+        // generation pipeline against that graph (not the stale state) so the code
+        // panel is populated. If validation fails, the exact error is shown as-is
+        // and no node is changed or auto-approved.
+        await handleGenerateCode(applied.nodes, applied.edges);
       }
     } catch (e: any) {
       addAria(e.message || 'Chat failed.');
@@ -710,6 +785,15 @@ export const WorkspacePage: React.FC = () => {
 
   const toolBtn = 'px-2 py-1.5 rounded-lg text-[11px] font-semibold text-slate-300 hover:text-white hover:bg-slate-800 disabled:opacity-30 transition-all border border-transparent hover:border-slate-700';
 
+  // Nodes still awaiting manual confirmation after image import. Surfaced as a
+  // persistent banner so the review requirement is visible even when the code
+  // panel is collapsed, and so the 422 from /api/generate-code is never a
+  // mystery: it names exactly these nodes.
+  const pendingReviewNodes = nodes.filter(n => (n.data as any)?.needs_review);
+  const pendingReviewList = pendingReviewNodes
+    .map(n => `#${n.id} (${String((n.data as any)?.label || 'no label').split('\n')[0]})`)
+    .join(', ');
+
   return (
     <div className="h-[100dvh] flex flex-col font-sans antialiased overflow-hidden" style={{ background: '#030817', color: '#fff' }}>
       <input
@@ -745,6 +829,17 @@ export const WorkspacePage: React.FC = () => {
 
       {aiBanner && (
         <div className="px-4 py-2 text-xs bg-amber-950/80 border-b border-amber-700/50 text-amber-200">{aiBanner} Manual drawing, debugger structure checks, and code execution still work.</div>
+      )}
+
+      {pendingReviewNodes.length > 0 && (
+        <div role="alert" className="px-4 py-2 text-xs bg-amber-950/80 border-b border-amber-700/50 text-amber-200 flex items-start gap-2">
+          <span className="font-bold">Needs review</span>
+          <span className="flex-1">
+            {pendingReviewNodes.length} imported node{pendingReviewNodes.length > 1 ? 's' : ''} need confirmation before code can be generated: {pendingReviewList}.
+            Double-click the amber-highlighted labels on the canvas to correct them.
+          </span>
+          <button onClick={() => setRightOpen(true)} className="shrink-0 px-2 py-0.5 rounded border border-amber-600/60 hover:bg-amber-900/40">Show code panel</button>
+        </div>
       )}
 
       <div className="flex flex-1 min-h-0 overflow-hidden relative">
@@ -795,7 +890,10 @@ export const WorkspacePage: React.FC = () => {
               <input
                 key={selectedEdge.id}
                 defaultValue={String(selectedEdge.label || '')}
-                onBlur={e => setEdgeBranch(selectedEdge.id, e.target.value.trim())}
+                onBlur={e => {
+                  const label = e.target.value.trim();
+                  if (label !== String(selectedEdge.label || '')) setEdgeBranch(selectedEdge.id, label);
+                }}
                 placeholder="Custom branch label"
                 aria-label="Custom branch label"
                 className="w-full bg-slate-900 border border-slate-700 text-[10px] rounded px-2 py-1.5 outline-none focus:border-cyan-500"
@@ -845,7 +943,7 @@ export const WorkspacePage: React.FC = () => {
             <button onClick={() => setZoom(zoomPct + 10)} className={toolBtn}>Zoom +</button>
             <button onClick={fitCanvas} className={toolBtn}>Fit</button>
             <div className="flex-1" />
-            <button onClick={handleGenerateCode} disabled={loadingCode || !nodes.length}
+            <button onClick={() => handleGenerateCode()} disabled={loadingCode || !nodes.length}
               className="px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-cyan-600 to-blue-600 disabled:opacity-50 shadow-[0_0_10px_rgba(6,182,212,0.35)]">
               {loadingCode ? 'Generating…' : 'Generate Python Code'}
             </button>
@@ -869,6 +967,11 @@ export const WorkspacePage: React.FC = () => {
                   <button onClick={() => handleAnalyzeImage(true)} disabled={loadingUpload} className="px-4 py-2.5 bg-slate-800 border border-slate-700 text-xs font-bold rounded-lg">Try Sample</button>
                 </div>
                 {uploadError && <p className="text-xs text-red-400 bg-red-900/20 border border-red-800/50 rounded-lg p-3">{uploadError}</p>}
+                {uploadWarnings.length > 0 && (
+                  <div className="text-xs text-amber-300 bg-amber-950/40 border border-amber-800/50 rounded-lg p-3 space-y-1">
+                    {uploadWarnings.map((w, i) => <p key={i}>{w}</p>)}
+                  </div>
+                )}
                 {uploadOverlay && <img src={`data:image/png;base64,${uploadOverlay}`} alt="Overlay" className="w-full rounded-lg border border-slate-700" />}
               </div>
             </div>
@@ -977,23 +1080,23 @@ export const WorkspacePage: React.FC = () => {
             <div className="p-3 border-b border-white/10 flex items-center justify-between bg-slate-950/40">
               <span className="text-xs font-bold text-cyan-400">Generated Python Code</span>
               <div className="flex items-center gap-1">
-                <button onClick={handleGenerateCode} disabled={loadingCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-cyan-900/40 border border-cyan-700">Generate</button>
+                <button onClick={() => handleGenerateCode()} disabled={loadingCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-cyan-900/40 border border-cyan-700">Generate</button>
                 <button onClick={handleCopyCode} disabled={!generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">{copied ? 'Copied!' : 'Copy'}</button>
                 <button onClick={handleDownloadCode} disabled={!generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">Download</button>
-                <button onClick={handleGenerateCode} disabled={loadingCode || !generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">Regenerate</button>
+                <button onClick={() => handleGenerateCode()} disabled={loadingCode || !generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">Regenerate</button>
                 <button onClick={() => setCodeOpen(!codeOpen)} className="text-slate-500 text-xs ml-1">{codeOpen ? '▲' : '▼'}</button>
               </div>
             </div>
             {codeOpen && (
               <div className="flex-1 overflow-y-auto" style={{ background: '#0d1117' }}>
-                {!generatedCode ? (
+                {!generatedCode && !codeWarnings.length ? (
                   <div className="flex flex-col items-center justify-center h-full gap-2 p-4 text-center">
                     <p className="text-slate-500 text-xs">No code yet. Build a flowchart, then Generate.</p>
                   </div>
                 ) : (
                   <div className="p-2">
                     {codeWarnings.map((w, i) => <div key={i} className="text-[10px] bg-yellow-900/30 border border-yellow-700/40 text-yellow-300 rounded px-2 py-1 mb-2">{w}</div>)}
-                    {generatedCode.split('\n').map((line, i) => <SyntaxLine key={i} line={line} num={i + 1} />)}
+                    {generatedCode && generatedCode.split('\n').map((line, i) => <SyntaxLine key={i} line={line} num={i + 1} />)}
                   </div>
                 )}
               </div>
@@ -1007,6 +1110,12 @@ export const WorkspacePage: React.FC = () => {
             </div>
             {runOpen && (
               <div className="p-3 space-y-3">
+                {execMode === 'browser' && loadingRun && (
+                  <div className="flex items-center gap-2 p-2 bg-amber-900/20 border border-amber-700/40 rounded-lg">
+                    <div className="w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-[10px] text-amber-300 font-semibold">Loading Pyodide runtime (first run may take 10–20s)…</span>
+                  </div>
+                )}
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] font-semibold text-slate-400">Program Input (one value per line)</label>
                   <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-start">
@@ -1033,6 +1142,11 @@ export const WorkspacePage: React.FC = () => {
                     <span className={`text-[10px] font-bold ${execStatus === 'success' ? 'text-green-400' : execStatus === 'error' ? 'text-red-400' : 'text-slate-500'}`}>
                       {execStatus === 'success' ? 'Success' : execStatus === 'error' ? 'Error' : 'Idle'}
                     </span>
+                    {execMode && (
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${execMode === 'browser' ? 'bg-amber-900/40 text-amber-300 border border-amber-600/40' : 'bg-cyan-900/40 text-cyan-300 border border-cyan-600/40'}`}>
+                        {execMode === 'browser' ? 'Browser (Pyodide)' : 'Server'}
+                      </span>
+                    )}
                   </div>
 
                   <div className="space-y-1">

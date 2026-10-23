@@ -3,27 +3,35 @@ FlowForge AI – Unified FastAPI Backend
 Serves the React/Vite SPA and provides all REST API endpoints.
 """
 
+import asyncio
 import ast as py_ast
 import base64
 import io
 import json
+import logging
 import os
 import re
+import urllib.parse
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 load_dotenv(BASE_DIR / ".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+MAX_IMAGE_UPLOAD_SIZE = 15 * 1024 * 1024  # 15 MB limit
+ALLOWED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+OCR_REVIEW_CONFIDENCE = 50
 
 import cv_engine
 import ocr_engine
@@ -31,21 +39,96 @@ import logic_engine
 import llm_generator
 import executor
 
-app = FastAPI(title="FlowForge AI API", version="3.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Verify the execution sandbox in the background so the first Run click is not slow.
+    executor.warm_up()
+    yield
+
+
+app = FastAPI(title="FlowForge AI API", version="3.0.0", lifespan=lifespan)
+
+def _cors_origins() -> list[str]:
+    """Approved browser origins for cross-origin API calls.
+
+    Set FLOWFORGE_ALLOWED_ORIGINS to a comma-separated allowlist in production
+    (for example "https://flowforge.onrender.com"). When the frontend is served by
+    this same FastAPI app no CORS entry is needed at all, because requests are
+    same-origin. If the variable is unset we fall back to the local Vite
+    dev/preview origins so local development keeps working.
+    """
+    raw = os.getenv("FLOWFORGE_ALLOWED_ORIGINS", "").strip()
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    else:
+        origins = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:4173",
+            "http://127.0.0.1:4173",
+        ]
+    # A wildcard can never be combined with credentials; refuse it outright.
+    return [o for o in origins if o != "*"]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+MAX_CONCURRENT_EXECUTIONS = int(os.getenv("FLOWFORGE_MAX_CONCURRENT_EXECUTIONS", "4"))
+_execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXECUTIONS)
+_active_executions = 0
+_executions_lock = asyncio.Lock()
+
+
+LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded", "via")
+
+
+def _request_is_local(request: Request) -> bool:
+    """True only for a direct connection from this machine (no reverse-proxy headers).
+
+    Best-effort guard used ONLY for the unsafe `local-dev` execution mode, so that it
+    cannot serve strangers by accident. It is not a substitute for not deploying that mode.
+    """
+    client = request.client.host if request.client else ""
+    if client not in LOCAL_CLIENT_HOSTS:
+        return False
+    return not any(header in request.headers for header in PROXY_HEADERS)
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint reporting AI availability and execution engine status."""
+    exec_status = executor.execution_status(block=False)
+    limits = executor.get_limits()
+    return JSONResponse({
+        "status": "ok",
+        "ai_available": bool(GEMINI_API_KEY),
+        "execution": exec_status,
+        "backend": "FlowForge AI API",
+        "version": "3.0.0",
+    })
+
 AI_UNAVAILABLE = "AI generation is currently unavailable. Please configure the backend API key."
 
 
 def pil_from_upload(file_bytes: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    # Protect against decompression bomb attacks
+    Image.MAX_IMAGE_PIXELS = 25_000_000
+    img = Image.open(io.BytesIO(file_bytes))
+    img = ImageOps.exif_transpose(img)
+    # Composite transparent/alpha channels onto a solid white background
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        white_bg.paste(rgba, (0, 0), rgba)
+        return white_bg.convert("RGB")
+    return img.convert("RGB")
 
 
 def img_to_b64(cv_img: np.ndarray) -> str:
@@ -120,22 +203,47 @@ NODE_TYPE_MAP = {
 }
 
 
+def _decision_condition_is_valid(text: str) -> bool:
+    """True when a decision label normalizes to a valid Python condition."""
+    try:
+        logic_engine.normalize_condition(text)
+        return True
+    except Exception:
+        return False
+
+
+_INPUT_VALUE_RE = re.compile(
+    r'^(print|input|output|display|show|write|read|get|enter)\s*', re.I
+)
+
+
+def _ai_reading_is_valid(block: dict, text: str) -> bool:
+    """Accept an AI OCR reading only when it is a structurally valid label.
+
+    An ambiguous label is cleared for review only if the recovered reading passes
+    the same per-type check the local path enforces: decision labels must compile
+    as a Python condition, and input/output shapes must carry a value (not just
+    the keyword).
+    """
+    shape_type = block.get("type", "process")
+    if shape_type == "decision":
+        return _decision_condition_is_valid(text)
+    if shape_type in ("input_output", "input", "output"):
+        value = _INPUT_VALUE_RE.sub("", text).strip().strip("\"'")
+        return bool(value)
+    return len(re.findall(r"[A-Za-z0-9]", text)) >= 2
+
+
 def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=None) -> list:
     nodes = []
     incoming = {str(connection["to"]) for connection in connections or []}
     outgoing = {str(connection["from"]) for connection in connections or []}
-    placeholder_labels = {
-        "input_output": "Unlabeled input/output",
-        "decision": "Unlabeled decision",
-        "process": "Unlabeled process",
-        "manual_input": "Unlabeled input",
-    }
     for i, b in enumerate(blocks):
         shape_type = b.get("type", "process")
         text = b.get("text", "").strip()
-        bbox = b.get("bbox", (0, 0, 50, 50))
         cx = b.get("center", (img_width // 2, (i + 1) * 100))[0]
         cy = b.get("center", (img_width // 2, (i + 1) * 100))[1]
+        needs_review = bool(b.get("text_uncertain"))
         if not text:
             if shape_type == "start_end":
                 if str(b["id"]) not in incoming and str(b["id"]) in outgoing:
@@ -143,25 +251,51 @@ def blocks_to_react_nodes(blocks, img_height=500, img_width=400, connections=Non
                 elif str(b["id"]) in incoming and str(b["id"]) not in outgoing:
                     text = "End"
                 else:
-                    text = "Unlabeled start/end"
+                    text = "Needs review: unread start/end"
+                needs_review = True
             else:
-                text = placeholder_labels.get(shape_type, "Unlabeled flowchart step")
+                text = "Needs review: unread"
+                needs_review = True
+
+        # Flag input/output nodes where OCR read only the keyword with no value
+        # (e.g. "Print" without "Even", or "Input" without "n"). High OCR confidence
+        # on just the keyword means text_uncertain is False, but the node is incomplete
+        # and must be corrected before code generation.
+        if not needs_review and shape_type in ("input_output", "input", "output") and text:
+            _value_part = re.sub(
+                r'^(print|input|output|display|show|write|read|get|enter)\s*',
+                '', text, flags=re.I
+            ).strip().strip('"\'')
+            if not _value_part:
+                needs_review = True
+
         x = int((cx / max(img_width, 1)) * 550) + 50
         y = int((cy / max(img_height, 1)) * 600) + 30
         nodes.append({
             "id": str(b["id"]),
             "type": NODE_TYPE_MAP.get(shape_type, "process"),
             "position": {"x": x, "y": y},
-            "data": {"label": text},
+            "data": {
+                "label": text,
+                "needs_review": needs_review,
+                "uncertain": needs_review,
+                "confidence": b.get("text_confidence", -1),
+            },
         })
     return nodes
 
 
 def connections_to_react_edges(connections) -> list:
     edges = []
-    for i, c in enumerate(connections):
+    ordered = sorted(
+        connections,
+        key=lambda c: (str(c["from"]), str(c["to"]), str(c.get("branch") or "")),
+    )
+    for i, c in enumerate(ordered):
         label = c.get("branch") or ""
         handle = "yes" if str(label).lower() in ("yes", "true") else ("no" if str(label).lower() in ("no", "false") else None)
+        is_uncertain = bool(c.get("uncertain"))
+        is_unconfirmed = bool(c.get("unconfirmed_suggestion"))
         e = {
             "id": f"e_{i}",
             "source": str(c["from"]),
@@ -169,15 +303,18 @@ def connections_to_react_edges(connections) -> list:
             "type": "smoothstep",
             "animated": True,
             "label": label,
+            "style": {"strokeDasharray": "5,5"} if is_uncertain else {},
             "data": {
                 "confidence": c.get("confidence", 1.0),
-                "uncertain": bool(c.get("uncertain")),
+                "uncertain": is_uncertain,
+                "unconfirmed_suggestion": is_unconfirmed,
             },
         }
         if handle:
             e["sourceHandle"] = handle
         edges.append(e)
     return edges
+
 
 
 def parse_json_object(raw: str) -> dict:
@@ -207,30 +344,30 @@ Return ONLY a JSON object (no markdown, no explanation) in this exact schema:
 {
   "nodes": [
     {"id": "1", "type": "start_end", "position": {"x": 300, "y": 50}, "data": {"label": "Start"}},
-    {"id": "2", "type": "input_output", "position": {"x": 300, "y": 150}, "data": {"label": "Input n"}}
+    {"id": "2", "type": "input_output", "position": {"x": 300, "y": 150}, "data": {"label": "Input n"}},
+    {"id": "3", "type": "process", "position": {"x": 300, "y": 250}, "data": {"label": "i = 1"}},
+    {"id": "4", "type": "decision", "position": {"x": 300, "y": 350}, "data": {"label": "i <= n?"}}
   ],
   "edges": [
     {"id": "e1-2", "source": "1", "target": "2", "type": "smoothstep", "animated": true, "label": ""},
-    {"id": "e3-4", "source": "3", "target": "4", "sourceHandle": "yes", "type": "smoothstep", "animated": true, "label": "Yes"}
+    {"id": "e2-3", "source": "2", "target": "3", "type": "smoothstep", "animated": true, "label": ""},
+    {"id": "e3-4", "source": "3", "target": "4", "type": "smoothstep", "animated": true, "label": ""},
+    {"id": "e4-5", "source": "4", "target": "5", "sourceHandle": "yes", "type": "smoothstep", "animated": true, "label": "Yes"}
   ]
 }
 
 Allowed node types: start_end, process, input_output, decision, document, predefined_process, database, manual_input, connector, offpage, delay
-- start_end: oval Start/End
-- process: rectangle
-- input_output: parallelogram (input / print)
-- decision: diamond; MUST have Yes and No outgoing edges labeled "Yes"/"No" with sourceHandle yes/no
-Always include Start and End. Layout top-to-bottom around x=300. Merge branches into shared End when they reconverge.
+- start_end: oval Start/End. Every flowchart MUST begin with Start and conclude at End.
+- process: rectangle (assignments and calculations, e.g. "fact = 1", "fact = fact * i", "i = i + 1"). Never output no-op assignments like "fact = fact".
+- input_output: parallelogram (e.g. "Input n", 'Print fact', 'Print "Even"').
+- decision: diamond; MUST have exactly two outgoing edges labeled "Yes" and "No" with sourceHandle yes/no.
+CRITICAL FLOWCHART LOGIC RULES:
+1. Every variable used in a condition or calculation MUST be initialized or input in a preceding node (e.g. "i = 1", "fact = 1", "Input n") before it is read.
+2. Every loop MUST include loop variable initialization before the decision AND a loop variable update (e.g. "i = i + 1") inside the loop body along the cycle back to the decision.
+3. Always layout top-to-bottom around x=300. Merge non-loop branches into a shared End when they finish.
 """
 
 
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "FlowForge AI API",
-        "ai_available": bool(GEMINI_API_KEY),
-    }
 
 
 @app.post("/api/analyze")
@@ -245,62 +382,303 @@ async def analyze(
             pil_img = Image.fromarray(cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2RGB))
         elif mode == "canvas" and canvas_data:
             img_bytes = base64.b64decode(canvas_data.split(",")[-1])
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img = pil_from_upload(img_bytes)
         elif file:
             contents = await file.read()
+            if len(contents) > MAX_IMAGE_UPLOAD_SIZE:
+                raise HTTPException(413, f"Uploaded image exceeds the {MAX_IMAGE_UPLOAD_SIZE // (1024 * 1024)}MB file size limit.")
             if len(contents) < 100:
                 raise HTTPException(400, "Uploaded file appears to be empty or too small.")
             name = (file.filename or "").lower()
-            if name and not name.endswith((".png", ".jpg", ".jpeg")):
-                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, or JPEG.")
+            if name and not any(name.endswith(ext) for ext in ALLOWED_IMAGE_EXTENSIONS):
+                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, JPEG, WEBP, or BMP.")
             try:
                 pil_img = pil_from_upload(contents)
             except Exception:
-                raise HTTPException(400, "Invalid image file. Please upload a PNG, JPG, or JPEG.")
+                raise HTTPException(400, "Invalid image file. Could not decode image data.")
         else:
-            raise HTTPException(400, "No image provided. Please upload a PNG, JPG, or JPEG.")
+            raise HTTPException(400, "No image provided. Please upload a PNG, JPG, JPEG, WEBP, or BMP.")
 
         norm_img = cv_engine.normalize_image(pil_img)
         h, w = norm_img.shape[:2]
+        logger.info("Image preprocessing complete: %dx%d", w, h)
         blocks, thresh = cv_engine.detect_symbols(norm_img)
 
         if not blocks:
             raise HTTPException(422, "No flowchart symbols detected. Please ensure the image contains clear shapes.")
 
+        shape_counts = {}
+        for block in blocks:
+            shape_type = block.get("type", "unknown")
+            shape_counts[shape_type] = shape_counts.get(shape_type, 0) + 1
+        logger.info(
+            "Shape detection complete: %d shapes (%s)",
+            len(blocks),
+            ", ".join(f"{shape_type}={count}" for shape_type, count in sorted(shape_counts.items())),
+        )
         connections, connection_warnings = cv_engine.detect_connections(thresh, blocks)
+        logger.info(
+            "Connection reconstruction complete: %d directed connections, %d uncertain",
+            len(connections),
+            sum(bool(connection.get("uncertain")) for connection in connections),
+        )
 
         ocr_failed = 0
+        ocr_uncertain = 0
         for b in blocks:
             try:
-                b["text"] = ocr_engine.extract_block_text(norm_img, b["bbox"])
+                b["text"], b["text_confidence"] = ocr_engine.extract_block_text_with_confidence(
+                    norm_img, b["bbox"]
+                )
+                # A decision condition whose comparison operators were misread
+                # (typically '≥'/'≤' collapsed to '=') is recovered from pixel
+                # evidence; the repair is only accepted when the recovered
+                # condition is valid Python, so nothing is approved blindly.
+                if b.get("type") == "decision" and b["text"]:
+                    bx, by, bw, bh = b["bbox"]
+                    roi = norm_img[by:by + bh, bx:bx + bw]
+                    repaired = ocr_engine.recover_condition_operators(b["text"], roi)
+                    if repaired != b["text"] and _decision_condition_is_valid(repaired):
+                        logger.info(
+                            "Recovered decision condition for shape #%s: %r -> %r",
+                            b["id"], b["text"], repaired,
+                        )
+                        b["text"] = repaired
+                        b["text_confidence"] = max(
+                            b["text_confidence"], float(OCR_REVIEW_CONFIDENCE + 10)
+                        )
+                b["text_uncertain"] = (
+                    not b["text"] or b["text_confidence"] < OCR_REVIEW_CONFIDENCE
+                )
                 if not b["text"]:
                     ocr_failed += 1
-            except Exception:
+                if b["text_uncertain"]:
+                    ocr_uncertain += 1
+                logger.debug(
+                    "OCR shape #%s (%s): confidence %.1f, text=%r",
+                    b["id"], b.get("type"), b["text_confidence"], b["text"],
+                )
+            except Exception as e:
                 b["text"] = ""
+                b["text_confidence"] = -1
+                b["text_uncertain"] = True
                 ocr_failed += 1
+                ocr_uncertain += 1
+                logger.warning("OCR failed for detected shape #%s: %s", b["id"], e)
 
+        # Optional Gemini Vision fallback: fills shapes local OCR could not read and
+        # re-checks ambiguous labels (the local reading is passed as a hint). A
+        # returned reading is only accepted as confident when it passes the same
+        # structural validation the local path uses - gating is never bypassed.
+        if (ocr_failed > 0 or ocr_uncertain > 0) and GEMINI_API_KEY:
+            try:
+                ai_texts = ocr_engine.extract_flowchart_text_with_gemini(
+                    pil_img, blocks, timeout_sec=6.0, include_uncertain=True
+                )
+                for b in blocks:
+                    bid = int(b["id"])
+                    ai_text = (ai_texts.get(bid) or "").strip()
+                    if not ai_text:
+                        continue
+                    if not b.get("text"):
+                        b["text"] = ai_text
+                        b["text_uncertain"] = True
+                        ocr_failed = max(0, ocr_failed - 1)
+                        ocr_uncertain += 1
+                    elif b.get("text_uncertain") and _ai_reading_is_valid(b, ai_text):
+                        logger.info(
+                            "Resolved ambiguous label for shape #%s via AI vision: %r -> %r",
+                            b["id"], b["text"], ai_text,
+                        )
+                        b["text"] = ai_text
+                        b["text_confidence"] = max(
+                            b["text_confidence"], float(OCR_REVIEW_CONFIDENCE + 10)
+                        )
+                        b["text_uncertain"] = False
+                        ocr_uncertain = max(0, ocr_uncertain - 1)
+            except Exception as e:
+                connection_warnings.append(f"AI vision OCR fell back to local recognition: {e}")
+
+        # Branch label recognition for decision diamonds
         if ocr_engine.tesseract_available():
             blocks_by_id = {int(block["id"]): block for block in blocks}
+            # 1. Broad surrounding OCR scan around each decision diamond
+            for block in blocks:
+                if block.get("type") != "decision":
+                    continue
+                bx, by, bw, bh = block["bbox"]
+                dcx, dcy = block["center"]
+                pad_x, pad_y = max(140, int(bw * 0.6)), max(90, int(bh * 0.5))
+                c_x1 = max(0, bx - pad_x)
+                c_y1 = max(0, by - pad_y)
+                c_x2 = min(w, bx + bw + pad_x)
+                c_y2 = min(h, by + bh + pad_y)
+                surround_crop = norm_img[c_y1:c_y2, c_x1:c_x2]
+                try:
+                    s_data = ocr_engine.pytesseract.image_to_data(
+                        surround_crop, config="--psm 11", output_type=ocr_engine.pytesseract.Output.DICT
+                    )
+                    texts = s_data.get("text", [])
+                    confs = s_data.get("conf", [])
+                    lefts = s_data.get("left", [])
+                    tops = s_data.get("top", [])
+                    widths = s_data.get("width", [])
+                    heights = s_data.get("height", [])
+                    dec_conns = [c for c in connections if int(c["from"]) == int(block["id"])]
+                    for i in range(len(texts)):
+                        w_text = str(texts[i]).strip()
+                        if not w_text:
+                            continue
+                        lbl = ocr_engine.clean_branch_label(w_text)
+                        if not lbl:
+                            continue
+                        w_conf = float(confs[i]) if i < len(confs) else 50.0
+                        if w_conf < 25:
+                            continue
+                        w_cx = c_x1 + lefts[i] + widths[i] // 2
+                        w_cy = c_y1 + tops[i] + heights[i] // 2
+                        best_conn = None
+                        min_d = float("inf")
+                        for conn in dec_conns:
+                            if conn.get("branch"):
+                                continue
+                            tb = blocks_by_id.get(int(conn["to"]))
+                            if not tb:
+                                continue
+                            tcx, tcy = tb["center"]
+                            same_side = (
+                                (w_cx < dcx and tcx < dcx)
+                                or (w_cx > dcx and tcx > dcx)
+                                or (w_cy > dcy and tcy > dcy and abs(w_cx - dcx) < bw * 0.4)
+                            )
+                            d = np.hypot(w_cx - tcx, w_cy - tcy)
+                            if same_side and d < min_d:
+                                min_d = d
+                                best_conn = conn
+                        if best_conn and not best_conn.get("branch"):
+                            best_conn["branch"] = lbl
+                            best_conn["confidence"] = max(float(best_conn.get("confidence", 0.5)), w_conf / 100.0)
+                            best_conn["uncertain"] = False
+                except Exception as ex:
+                    logger.debug("Decision surround OCR failed: %s", ex)
+
             for connection in connections:
                 start_block = blocks_by_id.get(int(connection["from"]))
                 end_block = blocks_by_id.get(int(connection["to"]))
                 if not start_block or start_block.get("type") != "decision" or connection.get("branch"):
                     continue
-                sx, sy = start_block["center"]
-                tx, ty = end_block["center"]
+
+                points_to_check = []
+                vec = connection.get("vector")
+                if vec:
+                    (vx1, vy1), (vx2, vy2) = vec
+                    for frac in (0.2, 0.4, 0.6):
+                        px = int(vx1 + (vx2 - vx1) * frac)
+                        py = int(vy1 + (vy2 - vy1) * frac)
+                        points_to_check.extend([(px, py), (px, py - 30), (px, py + 30)])
+
+                bx, by, bw, bh = start_block["bbox"]
+                cx, cy = start_block["center"]
+                tcx, tcy = end_block["center"]
+
+                if tcx < cx:
+                    lx, ly = bx, by + bh // 2
+                    points_to_check.extend([(lx - 45, ly - 30), (lx - 45, ly + 15), (lx - 30, ly - 35), (lx - 60, ly - 20), (lx - 90, ly - 30)])
+                if tcx > cx:
+                    rx, ry = bx + bw, by + bh // 2
+                    points_to_check.extend([(rx + 45, ry - 30), (rx + 45, ry + 15), (rx + 30, ry - 35), (rx + 60, ry - 20), (rx + 90, ry - 30)])
+                if tcy > cy:
+                    botx, boty = bx + bw // 2, by + bh
+                    points_to_check.extend([(botx - 30, boty + 30), (botx + 30, boty + 30)])
+
+                for frac in (0.3, 0.5, 0.7):
+                    points_to_check.append((int(cx + (tcx - cx) * frac), int(cy + (tcy - cy) * frac)))
+
                 branch_candidates = []
-                for fraction in (0.3, 0.5, 0.7):
-                    x = int(sx + (tx - sx) * fraction)
-                    y = int(sy + (ty - sy) * fraction)
-                    label, confidence = ocr_engine.extract_region_text_with_confidence(
-                        norm_img, (x - 36, y - 22, 72, 44)
-                    )
-                    if label:
-                        branch_candidates.append((label, confidence))
+                for px, py in points_to_check:
+                    w_box, h_box = 80, 48
+                    box = (px - w_box // 2, py - h_box // 2, w_box, h_box)
+                    txt, conf = ocr_engine.extract_region_text_with_confidence(norm_img, box)
+                    cleaned = ocr_engine.clean_branch_label(txt)
+                    if cleaned in ("Yes", "No"):
+                        branch_candidates.append((cleaned, conf))
+
                 if branch_candidates:
-                    label, confidence = max(branch_candidates, key=lambda candidate: candidate[1])
-                    if confidence >= 60:
-                        connection["branch"] = label
+                    chosen = max(branch_candidates, key=lambda c: c[1])[0]
+                    connection["branch"] = chosen
+                    connection["uncertain"] = False
+
+        warnings = [
+            w for w in connection_warnings
+            if not any(
+                f"from shape #{c['from']} to shape #{c['to']}" in w
+                and not c.get("uncertain")
+                for c in connections
+            )
+        ]
+
+        # Decision branches suggestion logic - Requirement 2:
+        # "Do not silently infer Yes/No branches. You may suggest a complementary branch label,
+        # but mark it uncertain and require user confirmation before generating code."
+        decision_ids = {str(block["id"]) for block in blocks if block.get("type") == "decision"}
+        for decision_id in decision_ids:
+            decision_edges = [edge for edge in connections if str(edge["from"]) == decision_id]
+            if len(decision_edges) == 2:
+                e1, e2 = decision_edges[0], decision_edges[1]
+                b1 = e1.get("branch", "")
+                b2 = e2.get("branch", "")
+                if b1 in ("Yes", "No") and not b2:
+                    comp = "No" if b1 == "Yes" else "Yes"
+                    e2["branch"] = comp
+                    e2["uncertain"] = True
+                    e2["unconfirmed_suggestion"] = True
+                    e2["confidence"] = 0.5
+                    warnings.append(
+                        f"Decision #{decision_id}: complementary branch label '{comp}' was suggested for path to shape #{e2['to']}; "
+                        "it is marked uncertain and requires user confirmation before code generation."
+                    )
+                elif b2 in ("Yes", "No") and not b1:
+                    comp = "No" if b2 == "Yes" else "Yes"
+                    e1["branch"] = comp
+                    e1["uncertain"] = True
+                    e1["unconfirmed_suggestion"] = True
+                    e1["confidence"] = 0.5
+                    warnings.append(
+                        f"Decision #{decision_id}: complementary branch label '{comp}' was suggested for path to shape #{e1['to']}; "
+                        "it is marked uncertain and requires user confirmation before code generation."
+                    )
+                elif not b1 and not b2:
+                    e1["uncertain"] = True
+                    e2["uncertain"] = True
+                    e1["confidence"] = min(float(e1.get("confidence", 1)), 0.5)
+                    e2["confidence"] = min(float(e2.get("confidence", 1)), 0.5)
+                    warnings.append(
+                        f"Branch labels for decision #{decision_id} could not be detected; both connections are marked for review. "
+                        "Please label the Yes and No branches."
+                    )
+                elif b1 == b2 and b1 in ("Yes", "No"):
+                    # Both branches have the same label (OCR misread, e.g. "No" read as "Yes").
+                    # Mark the second as uncertain and clear its label so the user can fix it.
+                    e2["branch"] = ""
+                    e2["uncertain"] = True
+                    e2["unconfirmed_suggestion"] = True
+                    e2["confidence"] = min(float(e2.get("confidence", 1)), 0.5)
+                    warnings.append(
+                        f"Decision #{decision_id}: both outgoing branches are labeled '{b1}'; "
+                        "the second branch is marked uncertain and needs a Yes/No label."
+                    )
+            elif len(decision_edges) < 2:
+                for edge in decision_edges:
+                    edge["uncertain"] = True
+                warnings.append(
+                    f"Decision #{decision_id} has only {len(decision_edges)} outgoing branch; decisions require both Yes and No branches."
+                )
+            elif len(decision_edges) > 2:
+                for edge in decision_edges:
+                    edge["uncertain"] = True
+                warnings.append(
+                    f"Decision #{decision_id} has {len(decision_edges)} outgoing connections; review the branch structure."
+                )
 
         overlay = cv_engine.overlay_detections(norm_img, blocks, connections)
         overlay_b64 = img_to_b64(overlay)
@@ -320,11 +698,11 @@ async def analyze(
                 "branch": c.get("branch", ""),
                 "confidence": c.get("confidence", 1.0),
                 "uncertain": bool(c.get("uncertain")),
+                "unconfirmed_suggestion": bool(c.get("unconfirmed_suggestion")),
             }
             for c in connections
         ]
 
-        warnings = list(connection_warnings)
         if not ocr_engine.tesseract_available():
             warnings.append(
                 "Tesseract OCR is unavailable; node and branch labels could not be read. "
@@ -332,16 +710,37 @@ async def analyze(
             )
         elif ocr_failed:
             warnings.append(
-                f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes. "
-                "Please review and edit those node labels on the canvas."
+                f"Could not read text from {ocr_failed} of {len(blocks)} detected shapes; marked as 'Needs review'. "
+                "Please review and edit those node labels on the canvas before generating code."
             )
-        decision_ids = {str(block["id"]) for block in blocks if block.get("type") == "decision"}
-        for decision_id in decision_ids:
-            decision_edges = [edge for edge in connections if str(edge["from"]) == decision_id]
-            if len(decision_edges) > 1 and any(not edge.get("branch") for edge in decision_edges):
-                warnings.append(
-                    f"Branch labels from decision {decision_id} could not be read; review these paths before generating code."
-                )
+        if ocr_uncertain and ocr_uncertain > ocr_failed:
+            uncertain_nodes = [
+                f"#{b['id']} ({b['text'].strip() or 'unread'})"
+                for b in blocks
+                if b.get("text_uncertain") and b.get("text")
+            ]
+            detail = ", ".join(uncertain_nodes) if uncertain_nodes else f"{ocr_uncertain - ocr_failed} shape(s)"
+            warnings.append(
+                f"These labels could not be confirmed automatically: {detail}. "
+                "Review and correct them on the canvas before generating code."
+            )
+
+        connected_ids = {
+            int(node_id)
+            for edge in connections
+            for node_id in (edge["from"], edge["to"])
+        }
+        missing_connections = [str(block["id"]) for block in blocks if int(block["id"]) not in connected_ids]
+        for mid in missing_connections:
+            warnings.append(f"Node #{mid} has no arrow connections.")
+
+        has_uncertain_edges = any(bool(e.get("uncertain")) or bool(e.get("unconfirmed_suggestion")) for e in connections)
+        has_needs_review_nodes = any(
+            n.get("data", {}).get("needs_review") or n.get("data", {}).get("uncertain")
+            for n in react_nodes
+        )
+        graph_status = "needs_review" if (has_uncertain_edges or has_needs_review_nodes or ocr_failed > 0 or missing_connections) else "verified"
+
         warning = " ".join(dict.fromkeys(warnings)) or None
 
         return JSONResponse({
@@ -352,11 +751,14 @@ async def analyze(
             "overlay_image": overlay_b64,
             "warning": warning,
             "warnings": list(dict.fromkeys(warnings)),
+            "graph_status": graph_status,
+            "missing_connections": missing_connections,
         })
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Analysis failed: {str(e)}")
+
 
 
 @app.post("/api/generate-flowchart")
@@ -367,23 +769,9 @@ async def generate_flowchart(request_body: dict):
 
     local = logic_engine.prompt_to_flowchart(prompt)
     if local:
-        if not GEMINI_API_KEY:
-            return JSONResponse(local)
-        # Prefer the built-in deterministic flowchart for common teaching patterns to keep
-        # credit usage low and avoid quota failures when Gemini is rate-limited.
-        try:
-            model = get_gemini_model()
-            system_prompt = f"""You are a flowchart designer. Given a programming task, create a detailed flowchart JSON.
-The flowchart is the source of truth — do NOT emit Python code.
-
-{FLOWCHART_JSON_SCHEMA}
-
-User request: {prompt}"""
-            response = model.generate_content(system_prompt)
-            data = normalize_ai_flowchart(parse_json_object(response.text))
-            return JSONResponse(data)
-        except Exception:
-            return JSONResponse(local)
+        # Prefer the verified deterministic flowchart for standard teaching patterns to ensure
+        # full algorithm correctness, avoid missing loop steps, and avoid quota limits.
+        return JSONResponse(local)
 
     if not GEMINI_API_KEY:
         raise HTTPException(503, AI_UNAVAILABLE)
@@ -414,35 +802,66 @@ async def generate_code(request_body: dict):
             raise HTTPException(400, "Canvas is empty. Please create a flowchart first.")
 
         nodes, edges = logic_engine.sanitize_graph(nodes, edges)
-        unlabeled = [
-            logic_engine.node_text(node)
-            for node in nodes
-            if not logic_engine.node_text(node)
+
+        # Check for unreadable / 'Needs review' nodes (Requirement 1)
+        needs_review_nodes = [
+            node for node in nodes
+            if (
+                isinstance(node.get("data"), dict)
+                and (node["data"].get("needs_review") or node["data"].get("uncertain"))
+            )
+            or logic_engine.node_text(node).lower().startswith("needs review")
+            or "needs review" in logic_engine.node_text(node).lower()
             or logic_engine.node_text(node).lower().startswith("unlabeled")
+            or not logic_engine.node_text(node).strip()
         ]
-        if unlabeled:
+        if needs_review_nodes:
+            reviewable = []
+            for node in needs_review_nodes:
+                label = logic_engine.node_text(node).strip()
+                reviewable.append(f"#{node.get('id')} ({label or 'no label'})")
             raise HTTPException(
                 422,
-                "Some imported flowchart labels could not be read. Edit the highlighted or unlabeled nodes, then generate Python again.",
+                "Some imported flowchart labels are unreadable or low-confidence and are marked 'Needs review'. "
+                "Please correct and confirm these nodes on the canvas before generating code: "
+                + ", ".join(reviewable) + ".",
             )
+
+        # Check for unconfirmed suggested decision branches (Requirement 2)
+        unconfirmed_edges = [
+            edge for edge in edges
+            if (isinstance(edge.get("data"), dict) and edge["data"].get("unconfirmed_suggestion"))
+            or edge.get("unconfirmed_suggestion")
+        ]
+        if unconfirmed_edges:
+            branch_list = ", ".join(
+                f"#{edge.get('source')}->#{edge.get('target')}" for edge in unconfirmed_edges
+            )
+            raise HTTPException(
+                422,
+                "Some decision branches have suggested labels that require user confirmation. "
+                "Please review and confirm or edit the branch labels before generating code: "
+                + branch_list + ".",
+            )
+
+        # Check for uncertain arrow connections (Requirement 5)
         uncertain_edges = [
             edge for edge in edges
             if isinstance(edge.get("data"), dict) and edge["data"].get("uncertain")
         ]
         if uncertain_edges:
+            edge_list = ", ".join(
+                f"#{edge.get('source')}->#{edge.get('target')}" for edge in uncertain_edges
+            )
             raise HTTPException(
                 422,
-                "Some imported connections have uncertain arrow direction. Review or reconnect the dashed edges before generating Python.",
+                "Some imported connections have uncertain arrow direction. "
+                "Review or reconnect the dashed edges before generating Python: "
+                + edge_list + ".",
             )
         ast_data = logic_engine.build_flowchart_ast(nodes, edges)
-        code = logic_engine.compile_to_python(ast_data)
 
-        warnings = []
-        try:
-            py_ast.parse(code)
-        except SyntaxError:
-            code = logic_engine.compile_to_python(ast_data)
-            warnings.append("LLM code had syntax errors; using the flowchart compiler instead.")
+        code = logic_engine.compile_to_python(ast_data)
 
         try:
             py_ast.parse(code)
@@ -452,8 +871,22 @@ async def generate_code(request_body: dict):
                 f"The current flowchart could not be translated to valid Python: {se.msg} (line {se.lineno}).",
             )
 
-        warnings.extend(logic_engine.consistency_warnings(ast_data, code))
-        return JSONResponse({"code": code, "ast": ast_data, "warnings": warnings})
+        undefined = logic_engine._undefined_identifiers(code)
+        if undefined:
+            vars_str = ", ".join(sorted(repr(u) for u in undefined))
+            raise HTTPException(
+                422,
+                f"Flowchart is incomplete: variable(s) {vars_str} are used in conditions or operations but never defined or initialized. "
+                "Add an initialization step (e.g. an assignment or input node) on the canvas before generating code.",
+            )
+
+        warnings = list(logic_engine.consistency_warnings(ast_data, code))
+        return JSONResponse({
+            "code": code,
+            "ast": ast_data,
+            "source": "compiler",
+            "warnings": warnings,
+        })
     except HTTPException:
         raise
     except ValueError as e:
@@ -463,28 +896,30 @@ async def generate_code(request_body: dict):
 
 
 @app.post("/api/execute")
-async def execute_code(request_body: dict):
+async def execute_code(request: Request, request_body: dict):
     try:
-        code = (request_body.get("code") or "").strip()
+        raw_code = request_body.get("code") or ""
         user_input = request_body.get("user_input", "")
+        if user_input is None:
+            user_input = ""
+        if not isinstance(raw_code, str) or not isinstance(user_input, str):
+            raise HTTPException(422, "Both 'code' and 'user_input' must be strings.")
+        code = raw_code.strip()
         if not code:
             raise HTTPException(400, "No code to execute. Generate Python from your flowchart first.")
-        try:
-            py_ast.parse(code)
-        except SyntaxError as se:
-            msg = f"Syntax Error: {str(se)}"
-            return JSONResponse({"output": msg, "stdout": "", "stderr": msg, "status": "error", "success": False, "error_details": msg, "program_output": ""})
-        output = executor.run_code_safely(code, user_input, timeout_sec=5)
-        output_text = str(output or "")
-        is_error = (
-            output_text.startswith(("Execution Error", "Syntax Error", "Security Error"))
-            or "Traceback (most recent call last):" in output_text
-            or "EOFError" in output_text
-            or "Exception" in output_text
-            or "Error:" in output_text
-        )
-        status = "error" if is_error else "success"
-        stdout = output_text
+
+        # Blocking work (sandbox + subprocess) runs in the thread pool so it cannot freeze the server.
+        result = await run_in_threadpool(executor.execute, code, user_input, 5, _request_is_local(request))
+        if result.status == "disabled":
+            raise HTTPException(403, result.message)
+        if result.status == "busy":
+            raise HTTPException(429, result.message, headers={"Retry-After": "2"})
+        if result.status == "too_large":
+            raise HTTPException(413, result.message)
+
+        output_text = result.legacy_output()
+        status = "success" if result.success else "error"
+        stdout = "" if result.status == "rejected" else output_text
         error_details = ""
         program_output = output_text.strip()
         if status == "error":
@@ -510,6 +945,10 @@ async def execute_code(request_body: dict):
             "success": status == "success",
             "error_details": error_details,
             "program_output": program_output,
+            # additive fields (the original contract above is unchanged)
+            "timed_out": result.timed_out,
+            "truncated": result.truncated,
+            "execution_mode": result.mode,
         })
     except HTTPException:
         raise
@@ -618,13 +1057,31 @@ Current graph: {json.dumps({"nodes": nodes, "edges": edges})}"""
     if local and local.get("trigger") == "generate_code":
         if not nodes:
             return JSONResponse({"reply": "The canvas is empty. Add a flowchart first, then I can generate Python.", "patch": None, "trigger": None})
-        ast_data = logic_engine.build_flowchart_ast(nodes, edges)
-        code = llm_generator.generate_python_code(ast_data, GEMINI_API_KEY or None)
+        try:
+            ast_data = logic_engine.build_flowchart_ast(nodes, edges)
+            code = logic_engine.compile_to_python(ast_data)
+            undefined = logic_engine._undefined_identifiers(code)
+            if undefined:
+                vars_str = ", ".join(sorted(repr(u) for u in undefined))
+                return JSONResponse({
+                    "reply": f"The flowchart is incomplete: variable(s) {vars_str} are used in conditions or operations but never defined or initialized. Add an initialization step on the canvas first.",
+                    "patch": None,
+                    "trigger": None,
+                    "error": True,
+                })
+        except ValueError as ve:
+            return JSONResponse({
+                "reply": f"Could not generate code: {str(ve)}",
+                "patch": None,
+                "trigger": None,
+                "error": True,
+            })
         return JSONResponse({
             "reply": "Generated Python from the current flowchart. It is now in the code panel.",
             "patch": None,
             "trigger": "generate_code",
             "code": code,
+            "source": "compiler",
             "warnings": logic_engine.consistency_warnings(ast_data, code),
         })
 
@@ -685,18 +1142,62 @@ User message: {message}"""
         raise HTTPException(500, f"Chat failed: {str(e)}")
 
 
-DIST_DIR = Path(__file__).parent / "landing" / "dist"
+DIST_DIR = Path(__file__).resolve().parent / "landing" / "dist"
 
-if DIST_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
 
-    @app.get("/")
-    async def serve_root():
-        return FileResponse(str(DIST_DIR / "index.html"))
+def _json_not_found(detail: str = "Not Found") -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=404)
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        file_path = DIST_DIR / full_path
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(DIST_DIR / "index.html"))
+
+def _safe_dist_file(relative: str) -> Optional[Path]:
+    """Return a regular file strictly inside DIST_DIR, or None.
+
+    The original handler joined the raw URL path onto DIST_DIR, so a request such as
+    /%2e%2e/%2e%2e/.env served files outside the build folder (including .env).
+    Here the path is fully resolved (this follows symlinks and '..') and must still be
+    inside DIST_DIR. Dot-files and dot-directories are never served.
+    """
+    if "\x00" in relative or "\\" in relative:
+        return None
+    if any(part.startswith(".") for part in relative.split("/") if part):
+        return None
+    try:
+        root = DIST_DIR.resolve()
+        candidate = (root / relative).resolve()
+        candidate.relative_to(root)
+    except (ValueError, OSError, RuntimeError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+# Any /api/* path that no route above handled is a JSON 404, never the frontend HTML.
+@app.api_route(
+    "/api/{rest:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    include_in_schema=False,
+)
+async def api_not_found(rest: str):
+    return _json_not_found()
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str):
+    if not DIST_DIR.is_dir():
+        return _json_not_found("Frontend build not found. Run 'npm run build' in the landing folder.")
+    # Reject dot-files and traversal attempts with 404, never serve them.
+    if any(part.startswith(".") for part in full_path.split("/") if part):
+        return _json_not_found()
+    file_path = _safe_dist_file(full_path)
+    if file_path is not None:
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"} if full_path.startswith("assets/") else None
+        return FileResponse(str(file_path), headers=headers)
+    # Missing assets and anything that looks like a file must 404, not return index.html.
+    last_segment = full_path.rsplit("/", 1)[-1]
+    if full_path.startswith("assets/") or "." in last_segment:
+        return _json_not_found()
+    index = _safe_dist_file("index.html")
+    if index is None:
+        return _json_not_found("Frontend build not found. Run 'npm run build' in the landing folder.")
+    return FileResponse(str(index))
+
+    return JSONResponse({"detail": "Not found"}, status_code=404)

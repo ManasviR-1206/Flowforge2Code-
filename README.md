@@ -47,6 +47,8 @@ For Vite hot reload, run the API on port 8001 and use a second terminal:
 
 Prompt or image → flowchart JSON → logic engine → Python 3. Regenerating after you edit a node (for example `sum = a + b` → `sum = a * b`) updates the code from the graph, not from the original prompt.
 
+Image uploads keep low-confidence OCR labels and arrow directions visible on the editable canvas and mark them for review; code generation waits until you correct a flagged node label or select/confirm a decision branch. OCR reads the detected shapes and does not add missing flowchart steps.
+
 ## Verify
 
 With the API running:

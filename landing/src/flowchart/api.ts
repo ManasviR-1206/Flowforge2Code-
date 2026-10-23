@@ -21,7 +21,12 @@ export function graphPayload(nodes: any[], edges: any[]) {
       id: n.id,
       type: n.type,
       position: n.position,
-      data: { label: n.data?.label || '' },
+      data: {
+        label: n.data?.label || '',
+        needs_review: Boolean(n.data?.needs_review),
+        uncertain: Boolean(n.data?.uncertain),
+        confidence: n.data?.confidence,
+      },
     })),
     edges: edges.map((e) => ({
       id: e.id,
@@ -29,7 +34,11 @@ export function graphPayload(nodes: any[], edges: any[]) {
       target: e.target,
       label: e.label || '',
       sourceHandle: e.sourceHandle,
-      data: e.data?.uncertain ? { uncertain: true, confidence: e.data.confidence } : undefined,
+      data: e.data ? {
+        uncertain: Boolean(e.data.uncertain),
+        unconfirmed_suggestion: Boolean(e.data.unconfirmed_suggestion),
+        confidence: e.data.confidence,
+      } : undefined,
       type: 'smoothstep',
       animated: true,
     })),

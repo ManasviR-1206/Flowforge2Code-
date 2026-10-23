@@ -3,6 +3,8 @@ __pycache__/
 
 node_modules/
 dist/
+* - Copy/
+* - Copy.*
 
 .env
 .env.*
@@ -12,3 +14,15 @@ dist/
 .idea/
 
 .DS_Store
+.pytest_cache/
+.venv/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing and test caches
+.pytest_cache/
+.coverage
+htmlcov/
