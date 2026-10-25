@@ -1,5 +1,15 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
+export class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+  }
+}
+
 export function apiUrl(path: string) {
   return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
 }
@@ -10,7 +20,7 @@ export async function apiJson(path: string, options?: RequestInit) {
   if (!res.ok) {
     const detail = (data as any)?.detail;
     const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail.map((d: any) => d.msg || d).join(' ') : (data as any)?.message || `Request failed (${res.status})`;
-    throw new Error(msg);
+    throw new ApiRequestError(msg, res.status);
   }
   return data;
 }
@@ -21,7 +31,12 @@ export function graphPayload(nodes: any[], edges: any[]) {
       id: n.id,
       type: n.type,
       position: n.position,
-      data: { label: n.data?.label || '' },
+      data: {
+        label: n.data?.label || '',
+        needs_review: Boolean(n.data?.needs_review),
+        uncertain: Boolean(n.data?.uncertain),
+        confidence: n.data?.confidence,
+      },
     })),
     edges: edges.map((e) => ({
       id: e.id,
@@ -29,7 +44,11 @@ export function graphPayload(nodes: any[], edges: any[]) {
       target: e.target,
       label: e.label || '',
       sourceHandle: e.sourceHandle,
-      data: e.data?.uncertain ? { uncertain: true, confidence: e.data.confidence } : undefined,
+      data: e.data ? {
+        uncertain: Boolean(e.data.uncertain),
+        unconfirmed_suggestion: Boolean(e.data.unconfirmed_suggestion),
+        confidence: e.data.confidence,
+      } : undefined,
       type: 'smoothstep',
       animated: true,
     })),
