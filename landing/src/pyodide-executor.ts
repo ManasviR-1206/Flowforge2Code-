@@ -32,8 +32,6 @@ export interface PyodideRunResult {
 // ---------------------------------------------------------------------------
 // Worker URL
 // ---------------------------------------------------------------------------
-const WORKER_URL = new URL('./pyodide-worker.ts', import.meta.url).href;
-
 // ---------------------------------------------------------------------------
 // Executor class
 // ---------------------------------------------------------------------------
@@ -95,7 +93,7 @@ export class PyodideExecutor {
   }
 
   private createWorker(): Worker {
-    const worker = new Worker(WORKER_URL, { type: 'module' });
+    const worker = new Worker(new URL('./pyodide-worker.ts', import.meta.url), { type: 'module' });
     worker.addEventListener('message', this._onMessage);
     worker.addEventListener('error', this._onError);
     return worker;

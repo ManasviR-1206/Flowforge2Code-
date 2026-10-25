@@ -16,6 +16,15 @@ export const UNSUPPORTED_MODULES = new Set([
   'asyncio', 'select', 'selectors', 'atexit',
 ]);
 
+export const MAX_OUTPUT_CHARS = 65536;
+
+export function appendLimitedOutput(current: string, text: string): string {
+  const combined = current + text;
+  return combined.length > MAX_OUTPUT_CHARS
+    ? combined.slice(0, MAX_OUTPUT_CHARS) + '\n[output truncated]'
+    : combined;
+}
+
 /**
  * Statically detect imports of modules that are not supported in Pyodide.
  * Returns a list of unsupported module names found in `code`.

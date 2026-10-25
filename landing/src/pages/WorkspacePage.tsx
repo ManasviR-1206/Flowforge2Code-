@@ -16,6 +16,7 @@ import { toPng } from 'html-to-image';
 import { nodeTypes } from '../flowchart/FlowNodes';
 import { SYMBOLS } from '../flowchart/symbols';
 import { apiJson, apiUrl, graphPayload } from '../flowchart/api';
+import { runWithBrowserFallback } from '../flowchart/execution-fallback';
 import { pyodideExecutor, browserResultToServerShape } from '../pyodide-executor';
 
 const edgeLook = (label?: string) => {
@@ -175,6 +176,7 @@ export const WorkspacePage: React.FC = () => {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
+  const uploadPreviewRef = useRef<string | null>(null);
   const [loadingUpload, setLoadingUpload] = useState(false);
   const [uploadOverlay, setUploadOverlay] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState('');
@@ -406,12 +408,36 @@ export const WorkspacePage: React.FC = () => {
   };
 
   const handleFileChange = (f: File | null) => {
-    setUploadFile(f);
     setUploadError('');
     setUploadWarnings([]);
     setUploadOverlay(null);
-    if (f) setUploadPreview(URL.createObjectURL(f));
+
+    // Revoke any previous object URL to avoid leaks, then clear stale state.
+    if (uploadPreviewRef.current) {
+      URL.revokeObjectURL(uploadPreviewRef.current);
+      uploadPreviewRef.current = null;
+    }
+    setUploadPreview(null);
+    setUploadFile(null);
+
+    if (!f) return;
+
+    if (!f.type || !f.type.startsWith('image/')) {
+      setUploadError('Unsupported file type. Please select a PNG or JPEG image.');
+      return;
+    }
+
+    const url = URL.createObjectURL(f);
+    uploadPreviewRef.current = url;
+    setUploadFile(f);
+    setUploadPreview(url);
   };
+
+  useEffect(() => {
+    return () => {
+      if (uploadPreviewRef.current) URL.revokeObjectURL(uploadPreviewRef.current);
+    };
+  }, []);
 
   const handleAnalyzeImage = async (useSample = false) => {
     setLoadingUpload(true);
@@ -565,10 +591,18 @@ export const WorkspacePage: React.FC = () => {
 
     // ---- 1. Try server-side execution first ----
     try {
-      const data = await apiJson('/api/execute', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: generatedCode, user_input: userInput }),
-      });
+      const execution = await runWithBrowserFallback(
+        () => apiJson('/api/execute', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: generatedCode, user_input: userInput }),
+        }),
+        () => runInBrowser(generatedCode, userInput),
+      );
+      if (execution.mode === 'browser') {
+        setLoadingRun(false);
+        return;
+      }
+      const data = execution.result;
       setExecMode('server');
       const status = data.status === 'error' ? 'error' : data.success ? 'success' : 'idle';
       const programOutput = typeof data.program_output === 'string' ? data.program_output : (typeof data.output === 'string' ? data.output : '');
@@ -581,13 +615,6 @@ export const WorkspacePage: React.FC = () => {
       return;
     } catch (e: any) {
       const msg = e.message || 'Execution error';
-      // If the server reports execution disabled (sandbox unavailable on this
-      // host), fall back to client-side Pyodide execution in the browser.
-      if (msg.includes('disabled') || msg.includes('sandbox') || e.status === 403) {
-        await runInBrowser(generatedCode, userInput);
-        setLoadingRun(false);
-        return;
-      }
       setExecStatus('error');
       setExecProgramOutput('');
       setExecErrorDetails(msg);
@@ -800,7 +827,7 @@ export const WorkspacePage: React.FC = () => {
         ref={uploadInputRef}
         type="file"
         accept=".png,.jpg,.jpeg,image/png,image/jpeg"
-        onChange={e => handleFileChange(e.target.files?.[0] || null)}
+        onChange={e => { handleFileChange(e.target.files?.[0] || null); e.target.value = ''; }}
         className="hidden"
       />
       <header className="h-14 flex items-center justify-between px-3 sm:px-6 border-b border-white/10 bg-slate-950/80 backdrop-blur-md sticky top-0 z-50 shrink-0">
@@ -955,7 +982,7 @@ export const WorkspacePage: React.FC = () => {
                 <h3 className="text-sm font-bold">Upload Flowchart Image</h3>
                 <p className="text-xs text-slate-400">PNG/JPG is sent to FastAPI → OpenCV shape detection → OCR → editable graph on the canvas. The image itself is not the flowchart.</p>
                 <div className="border-2 border-dashed border-slate-700 hover:border-cyan-500/50 rounded-xl p-6 flex flex-col items-center gap-3">
-                  {uploadPreview ? <img src={uploadPreview} alt="Preview" className="max-h-48 rounded-lg object-contain" /> : <div className="text-slate-500 text-sm">Drop or choose an image</div>}
+                  {uploadPreview ? <img src={uploadPreview} alt="Preview" className="max-h-48 rounded-lg object-contain" onError={() => setUploadError('Image preview failed to load.')} /> : <div className="text-slate-500 text-sm">Drop or choose an image</div>}
                   <button type="button" onClick={() => uploadInputRef.current?.click()} className="cursor-pointer px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded-lg">
                     Select Flowchart Image
                   </button>

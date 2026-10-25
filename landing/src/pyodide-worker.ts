@@ -21,11 +21,10 @@
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const PYODIDE_VERSION = '0.27.3';
+const PYODIDE_VERSION = '314.0.7';
 const PYODIDE_CDN = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
-const MAX_OUTPUT_CHARS = 65536;      // ~64 KB cap, mirrors the backend limit
 
-import { findUnsupportedImports } from './pyodide-utils';
+import { appendLimitedOutput, findUnsupportedImports, MAX_OUTPUT_CHARS } from './pyodide-utils';
 
 // ---------------------------------------------------------------------------
 // State
@@ -44,13 +43,21 @@ async function ensurePyodide(): Promise<any> {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    self.postMessage({ type: 'LOADING', progress: 0, message: 'Downloading Pyodide runtime…' });
-    // Dynamic import from a pinned CDN URL (type-safe shim below).
-    const mod = await import(/* @ts-ignore */ PYODIDE_CDN + 'pyodide.mjs');
-    const py = await mod.loadPyodide({ indexURL: PYODIDE_CDN });
-    self.postMessage({ type: 'LOADING', progress: 100, message: 'Pyodide ready.' });
-    pyodide = py;
-    return py;
+    try {
+      self.postMessage({ type: 'LOADING', progress: 0, message: 'Downloading Pyodide runtime…' });
+      // Dynamic import from a pinned CDN URL (type-safe shim below).
+      const mod = await import(/* @ts-ignore */ PYODIDE_CDN + 'pyodide.mjs');
+      const py = await mod.loadPyodide({ indexURL: PYODIDE_CDN });
+      self.postMessage({ type: 'LOADING', progress: 100, message: 'Pyodide ready.' });
+      pyodide = py;
+      return py;
+    } catch (err: any) {
+      // Reset so a later run can retry instead of reusing a rejected promise.
+      initPromise = null;
+      const message = `Failed to load the Pyodide runtime: ${err?.message || err}`;
+      self.postMessage({ type: 'LOADING', progress: 0, message });
+      throw new Error(message);
+    }
   })();
 
   return initPromise;
@@ -61,15 +68,9 @@ async function ensurePyodide(): Promise<any> {
 // ---------------------------------------------------------------------------
 function captureOutput(text: string, isError: boolean): void {
   if (isError) {
-    stderrBuffer += text;
-    if (stderrBuffer.length > MAX_OUTPUT_CHARS) {
-      stderrBuffer = stderrBuffer.slice(0, MAX_OUTPUT_CHARS) + '\n[output truncated]';
-    }
+    stderrBuffer = appendLimitedOutput(stderrBuffer, text);
   } else {
-    stdoutBuffer += text;
-    if (stdoutBuffer.length > MAX_OUTPUT_CHARS) {
-      stdoutBuffer = stdoutBuffer.slice(0, MAX_OUTPUT_CHARS) + '\n[output truncated]';
-    }
+    stdoutBuffer = appendLimitedOutput(stdoutBuffer, text);
   }
 }
 
@@ -82,13 +83,14 @@ function captureOutput(text: string, isError: boolean): void {
 // which we report as a normal runtime error).
 // ---------------------------------------------------------------------------
 function refillStdin(py: any): void {
-  const readline = () => {
+  const stdin = () => {
     if (inputQueue.length > 0) {
       return inputQueue.shift()! + '\n';
     }
-    return '';
+    // Returning null signals EOF in Pyodide 314+ (empty string is no longer EOF).
+    return null;
   };
-  py.setStdin({ readline, isatty: () => false });
+  py.setStdin({ stdin, isatty: () => false });
 }
 
 // ---------------------------------------------------------------------------

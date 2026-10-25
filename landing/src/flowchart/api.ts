@@ -1,5 +1,15 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
+export class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+  }
+}
+
 export function apiUrl(path: string) {
   return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
 }
@@ -10,7 +20,7 @@ export async function apiJson(path: string, options?: RequestInit) {
   if (!res.ok) {
     const detail = (data as any)?.detail;
     const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail.map((d: any) => d.msg || d).join(' ') : (data as any)?.message || `Request failed (${res.status})`;
-    throw new Error(msg);
+    throw new ApiRequestError(msg, res.status);
   }
   return data;
 }

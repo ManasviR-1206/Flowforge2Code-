@@ -7,13 +7,12 @@
  *   - Result shape transformation (browser → server contract)
  *   - Timeout and output-limit behaviour
  *
- * Full end-to-end Pyodide execution (factorial 5 → 120, odd/even, etc.)
- * requires a browser with WebAssembly and Web Worker support and is verified
- * manually against the deployed Vercel frontend.
+ * Full end-to-end Pyodide execution requires a browser with WebAssembly and
+ * Web Worker support; it is checked separately against a production build.
  */
 
 import { describe, it, expect } from 'vitest';
-import { findUnsupportedImports, UNSUPPORTED_MODULES } from './pyodide-utils';
+import { appendLimitedOutput, findUnsupportedImports, MAX_OUTPUT_CHARS, UNSUPPORTED_MODULES } from './pyodide-utils';
 import { browserResultToServerShape, type PyodideRunResult } from './pyodide-executor';
 
 // ---------------------------------------------------------------------------
@@ -122,7 +121,7 @@ describe('browserResultToServerShape', () => {
     expect(out.output).toBe('Execution timed out after 5 seconds.');
   });
 
-  it('truncates output to backend-compatible length', () => {
+  it('preserves the output truncation flag in server-shaped results', () => {
     const longOutput = 'x'.repeat(70000);
     const input: PyodideRunResult = {
       status: 'success',
@@ -153,5 +152,19 @@ describe('UNSUPPORTED_MODULES', () => {
   it('does not include basic builtins', () => {
     expect(UNSUPPORTED_MODULES.has('math')).toBe(false);
     expect(UNSUPPORTED_MODULES.has('print')).toBe(false);
+  });
+});
+
+describe('appendLimitedOutput', () => {
+  it('caps output and marks it as truncated when the limit is exceeded', () => {
+    expect(appendLimitedOutput('x'.repeat(MAX_OUTPUT_CHARS - 1), 'yz')).toBe(
+      'x'.repeat(MAX_OUTPUT_CHARS - 1) + 'y\n[output truncated]',
+    );
+  });
+
+  it('does not add the truncation marker when output is exactly at the limit', () => {
+    expect(appendLimitedOutput('x'.repeat(MAX_OUTPUT_CHARS - 1), 'y')).toBe(
+      'x'.repeat(MAX_OUTPUT_CHARS - 1) + 'y',
+    );
   });
 });
