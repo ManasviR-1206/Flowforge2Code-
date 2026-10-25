@@ -158,6 +158,53 @@ def get_gemini_model(model_name: str = "gemini-3.1-flash-lite"):
         raise HTTPException(503, f"AI generation is currently unavailable: {str(e)}")
 
 
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+]
+
+
+async def generate_gemini_text(prompt: str, per_model_timeout: float = 6.0) -> str:
+    """Call Gemini with real fallback and a bounded total timeout.
+
+    Uses REST transport and offloads the blocking SDK call to a thread so the
+    FastAPI event loop stays responsive. Raises HTTPException on total failure.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(503, AI_UNAVAILABLE)
+    try:
+        import google.generativeai as genai
+    except Exception as e:
+        raise HTTPException(503, f"AI generation is currently unavailable: {str(e)}")
+
+    genai.configure(api_key=GEMINI_API_KEY, transport="rest")
+    last_err: Exception | None = None
+    for name in GEMINI_MODEL_FALLBACKS:
+        try:
+            model = genai.GenerativeModel(name)
+            response = await asyncio.wait_for(
+                run_in_threadpool(
+                    model.generate_content,
+                    prompt,
+                    request_options={"timeout": per_model_timeout},
+                ),
+                timeout=per_model_timeout + 2,
+            )
+            text = getattr(response, "text", None)
+            if text:
+                return text
+            last_err = RuntimeError("Empty response from Gemini")
+        except Exception as e:
+            last_err = e
+            logging.warning("Gemini model %s failed: %s", name, type(e).__name__)
+            continue
+
+    detail = f"AI request failed or timed out: {type(last_err).__name__}" if last_err else "AI request failed"
+    raise HTTPException(504, detail)
+
+
 def generate_sample_flowchart_cv() -> np.ndarray:
     canvas = np.ones((620, 700, 3), dtype=np.uint8) * 255
     cv2.ellipse(canvas, (350, 45), (72, 26), 0, 0, 360, (0, 0, 0), 2)
@@ -780,15 +827,14 @@ async def generate_flowchart(request_body: dict):
         raise HTTPException(503, AI_UNAVAILABLE)
 
     try:
-        model = get_gemini_model()
         system_prompt = f"""You are a flowchart designer. Given a programming task, create a detailed flowchart JSON.
 The flowchart is the source of truth — do NOT emit Python code.
 
 {FLOWCHART_JSON_SCHEMA}
 
 User request: {prompt}"""
-        response = model.generate_content(system_prompt, request_options={'timeout': 15})
-        data = normalize_ai_flowchart(parse_json_object(response.text))
+        text = await generate_gemini_text(system_prompt)
+        data = normalize_ai_flowchart(parse_json_object(text))
         return JSONResponse(data)
     except HTTPException:
         raise
@@ -1025,14 +1071,13 @@ async def aria_chat(request_body: dict):
         built = logic_engine.prompt_to_flowchart(message)
         if GEMINI_API_KEY:
             try:
-                model = get_gemini_model()
                 system_prompt = f"""You are ARIA. Create a flowchart JSON for the user request. Return JSON:
 {{"reply":"short confirmation","patch":{{"action":"replace","nodes":[...],"edges":[...]}}}}
 {FLOWCHART_JSON_SCHEMA}
 User: {message}
 Current graph: {json.dumps({"nodes": nodes, "edges": edges})}"""
-                response = model.generate_content(system_prompt, request_options={'timeout': 15})
-                data = parse_json_object(response.text)
+                raw = await generate_gemini_text(system_prompt)
+                data = parse_json_object(raw)
                 patch = data.get("patch")
                 if patch and patch.get("nodes"):
                     nf = normalize_ai_flowchart(patch)
@@ -1096,7 +1141,6 @@ Current graph: {json.dumps({"nodes": nodes, "edges": edges})}"""
             return JSONResponse(local)
         raise HTTPException(503, AI_UNAVAILABLE)
 
-    model = get_gemini_model()
     flowchart_context = json.dumps({"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}, indent=2)
     system_prompt = f"""You are ARIA, the FlowForge AI assistant. Help users build, debug, and understand flowcharts. The flowchart graph is the source of truth.
 
@@ -1117,8 +1161,7 @@ RESPONSE JSON:
 
 User message: {message}"""
     try:
-        response = model.generate_content(system_prompt, request_options={'timeout': 15})
-        raw = response.text.strip()
+        raw = (await generate_gemini_text(system_prompt)).strip()
         try:
             data = parse_json_object(raw)
             reply = data.get("reply") or raw
