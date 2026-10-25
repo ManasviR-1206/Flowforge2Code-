@@ -18,6 +18,7 @@ import { SYMBOLS } from '../flowchart/symbols';
 import { apiJson, apiUrl, graphPayload } from '../flowchart/api';
 import { runWithBrowserFallback } from '../flowchart/execution-fallback';
 import { pyodideExecutor, browserResultToServerShape } from '../pyodide-executor';
+import { analyzeComplexity, complexityGrowthData, normalizeGrowthClass } from '../complexity-analysis';
 
 const edgeLook = (label?: string) => {
   const color = label === 'Yes' ? '#34d399' : label === 'No' ? '#f87171' : '#94a3b8';
@@ -161,6 +162,10 @@ export const WorkspacePage: React.FC = () => {
   const [execProgramOutput, setExecProgramOutput] = useState('');
   const [execErrorDetails, setExecErrorDetails] = useState('');
   const [execMode, setExecMode] = useState<'server' | 'browser' | null>(null);
+  const [complexityResult, setComplexityResult] = useState<any>(null);
+  const [selectedComplexity, setSelectedComplexity] = useState<string | null>(null);
+  const [loadingComplexity, setLoadingComplexity] = useState(false);
+  const [complexityError, setComplexityError] = useState('');
   const [loadingRun, setLoadingRun] = useState(false);
   const [debugIssues, setDebugIssues] = useState<any[]>([]);
   const [debugSummary, setDebugSummary] = useState('');
@@ -171,8 +176,11 @@ export const WorkspacePage: React.FC = () => {
     { role: 'aria', text: 'Hi! Describe what you want to build.' },
   ]);
   const [chatInput, setChatInput] = useState('');
+  const [chatError, setChatError] = useState('');
+  const [lastChatMessage, setLastChatMessage] = useState('');
   const [loadingChat, setLoadingChat] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatAbortRef = useRef<AbortController | null>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
@@ -436,6 +444,7 @@ export const WorkspacePage: React.FC = () => {
   useEffect(() => {
     return () => {
       if (uploadPreviewRef.current) URL.revokeObjectURL(uploadPreviewRef.current);
+      if (chatAbortRef.current) chatAbortRef.current.abort();
     };
   }, []);
 
@@ -645,6 +654,26 @@ export const WorkspacePage: React.FC = () => {
     setTimeout(() => outputEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80);
   }
 
+  const handleAnalyzeComplexity = () => {
+    if (!generatedCode) {
+      setComplexityError('Generate Python code first.');
+      setComplexityResult(null);
+      return;
+    }
+    setCodeOpen(true);
+    setLoadingComplexity(true);
+    setComplexityError('');
+    try {
+      const result = analyzeComplexity(generatedCode);
+      setComplexityResult(result);
+      setSelectedComplexity(normalizeGrowthClass(result.time.bigO));
+    } catch (e: any) {
+      setComplexityResult(null);
+      setComplexityError(e.message || 'Complexity analysis failed.');
+    }
+    setLoadingComplexity(false);
+  };
+
   const handleDebug = async () => {
     setLoadingDebug(true);
     setDebugIssues([]);
@@ -692,14 +721,21 @@ export const WorkspacePage: React.FC = () => {
 
   const handleSendChat = async (msg?: string) => {
     const text = (msg || chatInput).trim();
-    if (!text) return;
+    if (!text || loadingChat) return;
     setChatInput('');
+    setChatError('');
     setChatMessages(m => [...m, { role: 'user', text }]);
     setLoadingChat(true);
+
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
+    const timeoutId = window.setTimeout(() => controller.abort(), 20000);
+
     try {
       const data = await apiJson('/api/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, ...graphPayload(nodes, edges) }),
+        signal: controller.signal,
       });
       addAria(data.reply || '(No reply)', data.patch);
       const applied = data.patch ? applyPatch(data.patch) : undefined;
@@ -719,9 +755,24 @@ export const WorkspacePage: React.FC = () => {
         await handleGenerateCode(applied.nodes, applied.edges);
       }
     } catch (e: any) {
-      addAria(e.message || 'Chat failed.');
+      const isAbort = e?.name === 'AbortError';
+      const msg = isAbort
+        ? 'ARIA request timed out. Please retry.'
+        : e instanceof TypeError
+          ? 'Cannot reach the FlowForge API. Check the configured backend URL and make sure the backend is running.'
+          : (e.message || 'Chat failed.');
+      setChatError(msg);
+      setLastChatMessage(text);
+      addAria(msg);
+    } finally {
+      window.clearTimeout(timeoutId);
+      chatAbortRef.current = null;
+      setLoadingChat(false);
     }
-    setLoadingChat(false);
+  };
+
+  const handleRetryChat = () => {
+    if (lastChatMessage) handleSendChat(lastChatMessage);
   };
 
   const handleSave = () => {
@@ -774,6 +825,7 @@ export const WorkspacePage: React.FC = () => {
   }, []);
 
   const selectedNode = nodes.find(n => n.selected);
+  const complexityGrowth = complexityResult ? complexityGrowthData(selectedComplexity || complexityResult.time.bigO) : null;
   const selectedEdge = edges.find(e => e.selected);
 
   useEffect(() => {
@@ -1065,15 +1117,58 @@ export const WorkspacePage: React.FC = () => {
             </div>
             {chatOpen && (
               <>
-                <div className="flex-1 overflow-y-auto p-3 space-y-2 max-h-[160px]">
+                <div className="flex-1 overflow-y-auto p-4 space-y-3 max-h-[260px]">
                   {chatMessages.map((m, i) => (
-                    <div key={i} className={`text-[11px] rounded-xl px-3 py-2 ${m.role === 'aria' ? 'bg-violet-900/30 border border-violet-700/30' : 'bg-slate-800/80 border border-slate-700/50 ml-4'}`}>
-                      {m.role === 'aria' && <span className="text-violet-400 font-bold text-[10px] block mb-0.5">ARIA</span>}
-                      <pre className="whitespace-pre-wrap font-sans">{m.text}</pre>
-                      {m.patch && <span className="text-[10px] text-cyan-400 mt-1 block">Canvas updated</span>}
+                    <div key={i} className={`flex gap-2 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      {m.role === 'aria' && (
+                        <div className="w-8 h-8 rounded-full bg-violet-900/60 border border-cyan-500/40 flex items-center justify-center shrink-0" aria-hidden="true">
+                          <svg viewBox="0 0 32 32" className="w-5 h-5" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <rect x="7" y="8" width="18" height="14" rx="4" fill="#4c1d95" stroke="#22d3ee" strokeWidth="1.2" />
+                            <circle cx="12" cy="14" r="2" fill="#22d3ee" />
+                            <circle cx="20" cy="14" r="2" fill="#22d3ee" />
+                            <rect x="12" y="18" width="8" height="1.5" rx="0.75" fill="#a78bfa" />
+                            <line x1="16" y1="8" x2="16" y2="4" stroke="#a78bfa" strokeWidth="1.2" />
+                            <circle cx="16" cy="3.5" r="1.2" fill="#22d3ee" />
+                          </svg>
+                        </div>
+                      )}
+                      <div className={`text-[11px] rounded-xl px-3 py-2 max-w-[85%] ${m.role === 'aria' ? 'bg-violet-900/30 border border-violet-700/30' : 'bg-slate-800/80 border border-slate-700/50'}`}>
+                        {m.role === 'aria' && <span className="text-violet-400 font-bold text-[10px] block mb-0.5">ARIA</span>}
+                        <pre className="whitespace-pre-wrap font-sans break-words">{m.text}</pre>
+                        {m.patch && <span className="text-[10px] text-cyan-400 mt-1 block">Canvas updated</span>}
+                      </div>
                     </div>
                   ))}
-                  {loadingChat && <div className="text-violet-300 text-[11px] animate-pulse px-2">Thinking…</div>}
+                  {loadingChat && (
+                    <div className="flex gap-2 justify-start" role="status" aria-label="ARIA is thinking">
+                      <div className="w-8 h-8 rounded-full bg-violet-900/60 border border-cyan-500/40 flex items-center justify-center shrink-0" aria-hidden="true">
+                        <svg viewBox="0 0 32 32" className="w-5 h-5" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <rect x="7" y="8" width="18" height="14" rx="4" fill="#4c1d95" stroke="#22d3ee" strokeWidth="1.2" />
+                          <circle cx="12" cy="14" r="2" fill="#22d3ee" />
+                          <circle cx="20" cy="14" r="2" fill="#22d3ee" />
+                          <rect x="12" y="18" width="8" height="1.5" rx="0.75" fill="#a78bfa" />
+                          <line x1="16" y1="8" x2="16" y2="4" stroke="#a78bfa" strokeWidth="1.2" />
+                          <circle cx="16" cy="3.5" r="1.2" fill="#22d3ee" />
+                        </svg>
+                      </div>
+                      <div className="text-[11px] rounded-xl px-3 py-2 bg-violet-900/30 border border-violet-700/30 flex items-center gap-1">
+                        <span className="sr-only">ARIA is thinking</span>
+                        <span className="w-1.5 h-1.5 rounded-full bg-violet-400 motion-reduce:animate-none animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-violet-400 motion-reduce:animate-none animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-violet-400 motion-reduce:animate-none animate-bounce" style={{ animationDelay: '300ms' }} />
+                      </div>
+                    </div>
+                  )}
+                  {chatError && (
+                    <div className="text-[11px] rounded-xl px-3 py-2 bg-red-900/30 border border-red-700/40 text-red-200">
+                      {chatError}
+                      {lastChatMessage && (
+                        <button onClick={handleRetryChat} className="ml-2 px-2 py-0.5 rounded border border-red-600/60 hover:bg-red-900/40 text-[10px] font-semibold">
+                          Retry
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <div ref={chatEndRef} />
                 </div>
                 <div className="px-3 pb-2 flex flex-wrap gap-1">
@@ -1092,11 +1187,11 @@ export const WorkspacePage: React.FC = () => {
                     <button key={s} onClick={() => handleSendChat(`Create a flowchart to ${s.toLowerCase()}`)} className="px-2 py-1 rounded-lg text-[10px] bg-slate-900 border border-slate-800 text-slate-400 hover:text-cyan-300">{s}</button>
                   ))}
                 </div>
-                <div className="px-3 pb-3 flex gap-2">
-                  <input value={chatInput} onChange={e => setChatInput(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSendChat()}
+                <div className="px-3 pb-3 flex gap-2 items-end">
+                  <textarea value={chatInput} onChange={e => setChatInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendChat(); } }}
                     placeholder="Ask ARIA anything…" disabled={loadingChat}
-                    className="flex-1 bg-slate-900 border border-slate-700 focus:border-violet-500 text-[11px] rounded-lg px-3 py-2 outline-none" />
+                    rows={2} className="flex-1 bg-slate-900 border border-slate-700 focus:border-violet-500 text-[11px] rounded-lg px-3 py-2 outline-none resize-none" />
                   <button onClick={() => handleSendChat()} disabled={!chatInput.trim() || loadingChat} className="px-3 py-2 bg-violet-600 rounded-lg text-xs font-bold disabled:opacity-40">Send</button>
                 </div>
               </>
@@ -1106,11 +1201,12 @@ export const WorkspacePage: React.FC = () => {
           <div className="flex flex-col border-b border-white/10 shrink-0" style={{ minHeight: codeOpen ? '180px' : 'auto', maxHeight: codeOpen ? '280px' : 'auto' }}>
             <div className="p-3 border-b border-white/10 flex items-center justify-between bg-slate-950/40">
               <span className="text-xs font-bold text-cyan-400">Generated Python Code</span>
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 <button onClick={() => handleGenerateCode()} disabled={loadingCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-cyan-900/40 border border-cyan-700">Generate</button>
                 <button onClick={handleCopyCode} disabled={!generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">{copied ? 'Copied!' : 'Copy'}</button>
                 <button onClick={handleDownloadCode} disabled={!generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">Download</button>
                 <button onClick={() => handleGenerateCode()} disabled={loadingCode || !generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-slate-800 border border-slate-700 disabled:opacity-40">Regenerate</button>
+                <button onClick={handleAnalyzeComplexity} disabled={loadingComplexity || !generatedCode} className="px-2 py-1 rounded-md text-[10px] font-semibold bg-violet-900/40 border border-violet-700 disabled:opacity-40">{loadingComplexity ? 'Analyzing…' : 'Analyze Complexity'}</button>
                 <button onClick={() => setCodeOpen(!codeOpen)} className="text-slate-500 text-xs ml-1">{codeOpen ? '▲' : '▼'}</button>
               </div>
             </div>
@@ -1124,6 +1220,93 @@ export const WorkspacePage: React.FC = () => {
                   <div className="p-2">
                     {codeWarnings.map((w, i) => <div key={i} className="text-[10px] bg-yellow-900/30 border border-yellow-700/40 text-yellow-300 rounded px-2 py-1 mb-2">{w}</div>)}
                     {generatedCode && generatedCode.split('\n').map((line, i) => <SyntaxLine key={i} line={line} num={i + 1} />)}
+                    {complexityError && <div className="text-[10px] bg-red-900/30 border border-red-700/40 text-red-300 rounded px-2 py-1 mt-2">{complexityError}</div>}
+                    {complexityResult && (
+                      <div className="mt-3 p-3 rounded-lg bg-slate-900/60 border border-slate-700 text-[11px] space-y-2">
+                        <div className="font-bold text-violet-400">Complexity Analysis</div>
+                        <div>
+                          <span className="font-semibold text-cyan-300">Time:</span> {complexityResult.time.bigO}
+                          <span className="text-slate-400 ml-2">(best {complexityResult.time.best}, avg {complexityResult.time.average}, worst {complexityResult.time.worst})</span>
+                        </div>
+                        <p className="text-slate-300">{complexityResult.time.explanation}</p>
+                        <div>
+                          <span className="font-semibold text-cyan-300">Space (auxiliary):</span> {complexityResult.space.bigO}
+                        </div>
+                        <p className="text-slate-300">{complexityResult.space.explanation}</p>
+                        {complexityResult.time.influential?.length > 0 && (
+                          <div>
+                            <span className="font-semibold text-slate-400">Influential sections:</span>
+                            <ul className="list-disc ml-4 text-slate-400">
+                              {complexityResult.time.influential.map((s: string, i: number) => <li key={i}>{s}</li>)}
+                              {complexityResult.space.influential.map((s: string, i: number) => <li key={`s-${i}`}>{s}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                        <details className="text-slate-500">
+                          <summary className="cursor-pointer">Assumptions</summary>
+                          <ul className="list-disc ml-4">
+                            {[...complexityResult.time.assumptions, ...complexityResult.space.assumptions].map((a: string, i: number) => <li key={i}>{a}</li>)}
+                          </ul>
+                        </details>
+
+                        <div className="mt-2">
+                          <div className="font-semibold text-slate-300 mb-1">Why this complexity?</div>
+                          <p className="text-slate-400">{complexityResult.time.explanation}</p>
+                          <p className="text-slate-400 mt-1">{complexityResult.space.explanation}</p>
+                        </div>
+
+                        {complexityGrowth && (
+                          <div className="mt-3">
+                            <div className="font-semibold text-slate-300 mb-1">Growth comparison (illustrative)</div>
+                            <svg viewBox="0 0 320 180" className="w-full h-auto" role="img" aria-label="Complexity growth comparison">
+                              {(() => {
+                                const pts = [1, 2, 4, 8, 16];
+                                const maxY = Math.max(...complexityGrowth.series.flatMap(s => s.values), 1);
+                                const logMax = Math.log10(maxY + 1);
+                                const x = (i: number) => 40 + i * 56;
+                                const y = (v: number) => 160 - (Math.log10(v + 1) / logMax) * 140;
+                                return (
+                                  <>
+                                    <line x1="40" y1="20" x2="40" y2="160" stroke="#475569" />
+                                    <line x1="40" y1="160" x2="280" y2="160" stroke="#475569" />
+                                    {complexityGrowth.series.map((s) => (
+                                      <polyline
+                                        key={s.label}
+                                        points={s.values.map((v, i) => `${x(i)},${y(v)}`).join(' ')}
+                                        fill="none"
+                                        stroke={s.highlight ? '#22d3ee' : '#64748b'}
+                                        strokeWidth={s.highlight ? 2.5 : 1.2}
+                                        opacity={s.highlight ? 1 : 0.6}
+                                      />
+                                    ))}
+                                    {pts.map((n, i) => (
+                                      <text key={n} x={x(i)} y="175" textAnchor="middle" fontSize="9" fill="#94a3b8">{n}</text>
+                                    ))}
+                                    <text x="160" y="192" textAnchor="middle" fontSize="9" fill="#94a3b8">input size n</text>
+                                    <text x="12" y="90" textAnchor="middle" fontSize="9" fill="#94a3b8" transform="rotate(-90 12 90)">growth</text>
+                                  </>
+                                );
+                              })()}
+                            </svg>
+                            <div className="flex flex-wrap gap-2 mt-2 text-[10px]">
+                              {complexityGrowth.series.map((s) => (
+                                <button
+                                  key={s.label}
+                                  type="button"
+                                  onClick={() => setSelectedComplexity(s.label)}
+                                  className={`px-1.5 py-0.5 rounded border ${s.label === selectedComplexity ? 'border-cyan-400 text-cyan-300 bg-cyan-900/20' : 'border-slate-700 text-slate-400 hover:border-slate-500'}`}
+                                >
+                                  {s.label}
+                                </button>
+                              ))}
+                            </div>
+                            <p className="text-[10px] text-slate-500 mt-1">
+                              Illustrative asymptotic growth comparison only; not measured runtime or memory.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

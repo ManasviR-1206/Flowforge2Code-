@@ -74,6 +74,9 @@ def _cors_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
+    # Allow Vercel preview deployments for this project without opening CORS
+    # to arbitrary origins. Production still requires an explicit allowlist entry.
+    allow_origin_regex=r"https://flowforge2-code-[a-z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -136,14 +139,14 @@ def img_to_b64(cv_img: np.ndarray) -> str:
     return base64.b64encode(buf).decode("utf-8")
 
 
-def get_gemini_model(model_name: str = "gemini-3.8-flash"):
+def get_gemini_model(model_name: str = "gemini-3.1-flash-lite"):
     if not GEMINI_API_KEY:
         raise HTTPException(503, AI_UNAVAILABLE)
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         last_err = None
-        for name in (model_name, "gemini-3.8-flash"):
+        for name in (model_name, "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash", "gemini-3-flash-preview"):
             try:
                 return genai.GenerativeModel(name)
             except Exception as e:
@@ -784,7 +787,7 @@ The flowchart is the source of truth — do NOT emit Python code.
 {FLOWCHART_JSON_SCHEMA}
 
 User request: {prompt}"""
-        response = model.generate_content(system_prompt)
+        response = model.generate_content(system_prompt, request_options={'timeout': 15})
         data = normalize_ai_flowchart(parse_json_object(response.text))
         return JSONResponse(data)
     except HTTPException:
@@ -969,7 +972,7 @@ async def debug_flowchart(request_body: dict):
             prompt = f"""Analyze this flowchart AST for logical errors (not style advice).
 Flowchart: {json.dumps(ast_data, indent=2)}
 Return ONLY a JSON array of {{"type":"warning","message":"...","node_id":"id_or_null"}}. If none, []."""
-            response = model.generate_content(prompt)
+            response = model.generate_content(prompt, request_options={'timeout': 15})
             issues.extend(parse_json_array(response.text))
         except Exception:
             pass
@@ -995,7 +998,7 @@ Current nodes: {json.dumps(nodes, indent=2)}
 Current edges: {json.dumps(edges, indent=2)}
 Issues: {json.dumps(issues, indent=2)}
 {FLOWCHART_JSON_SCHEMA}"""
-            response = model.generate_content(prompt)
+            response = model.generate_content(prompt, request_options={'timeout': 15})
             data = normalize_ai_flowchart(parse_json_object(response.text))
             return JSONResponse(data)
         except Exception:
@@ -1028,7 +1031,7 @@ async def aria_chat(request_body: dict):
 {FLOWCHART_JSON_SCHEMA}
 User: {message}
 Current graph: {json.dumps({"nodes": nodes, "edges": edges})}"""
-                response = model.generate_content(system_prompt)
+                response = model.generate_content(system_prompt, request_options={'timeout': 15})
                 data = parse_json_object(response.text)
                 patch = data.get("patch")
                 if patch and patch.get("nodes"):
@@ -1114,7 +1117,7 @@ RESPONSE JSON:
 
 User message: {message}"""
     try:
-        response = model.generate_content(system_prompt)
+        response = model.generate_content(system_prompt, request_options={'timeout': 15})
         raw = response.text.strip()
         try:
             data = parse_json_object(raw)
