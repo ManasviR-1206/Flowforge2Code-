@@ -165,8 +165,11 @@ GEMINI_MODEL_FALLBACKS = [
     "gemini-3-flash-preview",
 ]
 
+GEMINI_TOTAL_TIMEOUT = 18.0
+GEMINI_PER_MODEL_TIMEOUT = 6.0
 
-async def generate_gemini_text(prompt: str, per_model_timeout: float = 6.0) -> str:
+
+async def generate_gemini_text(prompt: str, per_model_timeout: float = GEMINI_PER_MODEL_TIMEOUT) -> str:
     """Call Gemini with real fallback and a bounded total timeout.
 
     Uses REST transport and offloads the blocking SDK call to a thread so the
@@ -181,25 +184,43 @@ async def generate_gemini_text(prompt: str, per_model_timeout: float = 6.0) -> s
 
     genai.configure(api_key=GEMINI_API_KEY, transport="rest")
     last_err: Exception | None = None
+    has_non_ascii = any(ord(ch) > 127 for ch in prompt)
+    ascii_prompt = prompt.encode("ascii", "backslashreplace").decode("ascii") if has_non_ascii else prompt
+
+    deadline = asyncio.get_running_loop().time() + GEMINI_TOTAL_TIMEOUT
     for name in GEMINI_MODEL_FALLBACKS:
-        try:
-            model = genai.GenerativeModel(name)
-            response = await asyncio.wait_for(
-                run_in_threadpool(
-                    model.generate_content,
-                    prompt,
-                    request_options={"timeout": per_model_timeout},
-                ),
-                timeout=per_model_timeout + 2,
-            )
-            text = getattr(response, "text", None)
-            if text:
-                return text
-            last_err = RuntimeError("Empty response from Gemini")
-        except Exception as e:
-            last_err = e
-            logging.warning("Gemini model %s failed: %s", name, type(e).__name__)
-            continue
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        for prompt_variant in ([prompt, ascii_prompt] if has_non_ascii else [prompt]):
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining < 1:
+                break
+            try:
+                model = genai.GenerativeModel(name)
+                response = await asyncio.wait_for(
+                    run_in_threadpool(
+                        model.generate_content,
+                        prompt_variant,
+                        request_options={"timeout": min(per_model_timeout, remaining)},
+                    ),
+                    timeout=min(per_model_timeout + 2, remaining),
+                )
+                text = getattr(response, "text", None)
+                if text:
+                    return text
+                last_err = RuntimeError("Empty response from Gemini")
+                break
+            except Exception as e:
+                last_err = e
+                logging.warning("Gemini model %s failed: %s", name, type(e).__name__)
+                logging.debug("Gemini failure detail: %r", str(e)[:200])
+                # On UnicodeEncodeError, try the ASCII variant for the same model;
+                # otherwise move on to the next model.
+                if isinstance(e, UnicodeEncodeError) and prompt_variant is prompt:
+                    continue
+                break
 
     detail = f"AI request failed or timed out: {type(last_err).__name__}" if last_err else "AI request failed"
     raise HTTPException(504, detail)
